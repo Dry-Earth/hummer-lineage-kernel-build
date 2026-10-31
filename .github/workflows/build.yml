@@ -40,14 +40,20 @@ jobs:
           echo "$(pwd)/bin" >> $GITHUB_PATH
           echo "CLANG_PATH=$(pwd)/bin" >> $GITHUB_ENV
 
-      - name: Clone LineageOS kernel source
+      - name: Clone LineageOS kernel source (with sibling repos)
         run: |
           git clone https://github.com/LineageOS/android_kernel_oneplus_sm8750.git kernel --depth=1 --branch lineage-23.2
+          # The kernel tree contains symlinks pointing to sibling repos.
+          # They MUST be cloned next to the kernel dir, otherwise Kconfig parsing fails.
+          git clone --depth=1 --branch lineage-23.2 https://github.com/LineageOS/android_kernel_oneplus_sm8750-modules.git sm8750-modules || git clone --depth=1 https://github.com/LineageOS/android_kernel_oneplus_sm8750-modules.git sm8750-modules
+          git clone --depth=1 --branch lineage-23.2 https://github.com/LineageOS/android_kernel_oneplus_sm8750-devicetrees.git sm8750-devicetrees || git clone --depth=1 https://github.com/LineageOS/android_kernel_oneplus_sm8750-devicetrees.git sm8750-devicetrees
+          # Verify the critical symlink now resolves          ls -l kernel/drivers/base/kernelFwUpdate/
 
       - name: Inject KernelSU Next
         if: inputs.ksu_type == 'ksunext'
         run: |
-          cd kernel          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
+          cd kernel
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
           cd ..
 
       - name: Apply Droidspaces GKI kABI patch
@@ -55,10 +61,12 @@ jobs:
         run: |
           cd kernel
           echo "Applying GKI kABI patch..."
-          wget -q https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
-          if ! patch -p1 -F 3 < 001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch; then
-            echo "WARNING: kABI patch failed, continuing anyway."
+          wget -q -O kabi.patch https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch || { echo "FATAL: kABI patch download failed"; exit 1; }
+          if ! patch -p1 -F 3 < kabi.patch; then
+            echo "FATAL: kABI patch failed to apply. Aborting to prevent bootloop."
+            exit 1
           fi
+          echo "kABI patch applied successfully."
           cd ..
 
       - name: Configure kernel (GKI safe)
@@ -88,15 +96,15 @@ jobs:
           scripts/config --file .config --enable CONFIG_TMPFS_POSIX_ACL
           scripts/config --file .config --enable CONFIG_TMPFS_XATTR
           if [[ "${{ inputs.ksu_type }}" == "ksunext" ]]; then
-            scripts/config --file .config --enable CONFIG_KSU
-            scripts/config --file .config --set-str CONFIG_KSU_EXPECTED_SIZE 0x0
+            scripts/config --file .config --enable CONFIG_KSU            scripts/config --file .config --set-str CONFIG_KSU_EXPECTED_SIZE 0x0
             scripts/config --file .config --set-str CONFIG_KSU_EXPECTED_HASH ""
           fi
           make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
 
       - name: Build kernel
         run: |
-          cd kernel          echo "Building kernel, this may take 20-30 minutes..."
+          cd kernel
+          echo "Building kernel, this may take 20-30 minutes..."
           make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 -j$(nproc)
 
       - name: Prepare AnyKernel3
