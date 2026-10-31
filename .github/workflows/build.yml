@@ -32,7 +32,8 @@ jobs:
       - name: Inject KernelSU-Next
         run: |
           cd kernel
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/main/kernel/setup.sh" | bash -s next
+          # 使用官方文档推荐的 next 分支命令
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
           cd ..
 
       - name: Configure Kernel for Droidspaces & KernelSU
