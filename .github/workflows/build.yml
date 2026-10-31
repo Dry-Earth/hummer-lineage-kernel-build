@@ -26,7 +26,8 @@ jobs:
 
       - name: Clone LineageOS Kernel Source
         run: |
-          git clone https://github.com/LineageOS/android_kernel_oneplus_sm8750.git kernel --depth=1 --branch lineage-24.0
+          # 关键修改：使用 lineage-23.2 分支以匹配您的 ROM
+          git clone https://github.com/LineageOS/android_kernel_oneplus_sm8750.git kernel --depth=1 --branch lineage-23.2
 
       - name: Inject KernelSU-Next
         run: |
