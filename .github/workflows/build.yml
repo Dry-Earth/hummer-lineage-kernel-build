@@ -2,14 +2,12 @@ name: Build LineageOS Kernel for hummer (PKR110) - Droidspaces Ready
 
 env:
   TZ: Asia/Shanghai
-  KERNEL_VERSION: '6.6'
-  SUB_VERSION: '89'
 
 on:
   workflow_dispatch:
     inputs:
       ksu_type:
-        description: 'KernelSU 分支'
+        description: 'KernelSU branch'
         required: true
         type: choice
         default: 'ksunext'
@@ -17,7 +15,7 @@ on:
           - 'ksunext'
           - 'none'
       droidspaces_enable:
-        description: '启用 Droidspaces 容器支持 (必须选 standard)'
+        description: 'Enable Droidspaces support'
         required: true
         type: choice
         default: 'standard'
@@ -28,54 +26,45 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: 安装环境依赖
+      - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y git curl python3 build-essential bc bison flex libssl-dev libelf-dev lz4 zstd zip unzip lld patch
 
-      - name: 下载 LLVM-Clang 工具链
+      - name: Download LLVM-Clang toolchain
         run: |
           mkdir -p toolchain
           cd toolchain
-          # 使用 Android 官方稳定的 Clang 工具链
           curl -L -o clang.tar.gz "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r522817.tar.gz"
           tar -xzf clang.tar.gz
           echo "$(pwd)/bin" >> $GITHUB_PATH
           echo "CLANG_PATH=$(pwd)/bin" >> $GITHUB_ENV
 
-      - name: 克隆 LineageOS 内核源码
+      - name: Clone LineageOS kernel source
         run: |
           git clone https://github.com/LineageOS/android_kernel_oneplus_sm8750.git kernel --depth=1 --branch lineage-23.2
 
-      - name: 注入 KernelSU Next        if: inputs.ksu_type == 'ksunext'
+      - name: Inject KernelSU Next
+        if: inputs.ksu_type == 'ksunext'
         run: |
-          cd kernel
-          # 使用官方推荐的 next 分支注入脚本
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
+          cd kernel          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
           cd ..
 
-      - name: 应用 Droidspaces GKI kABI 补丁 (核心安全步骤)
+      - name: Apply Droidspaces GKI kABI patch
         if: inputs.droidspaces_enable == 'standard'
         run: |
           cd kernel
-          echo "正在下载并应用 GKI kABI 修复补丁..."
-          # 从 Droidspaces 官方仓库下载针对 6.6 内核的 kABI 补丁
+          echo "Applying GKI kABI patch..."
           wget -q https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
-          
-          # 尝试应用补丁。如果失败，输出警告但继续 (防止因微小差异导致整个编译中断)
           if ! patch -p1 -F 3 < 001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch; then
-            echo "WARNING: kABI patch 应用遇到阻力，但将继续编译。请刷入后密切关注稳定性。"
+            echo "WARNING: kABI patch failed, continuing anyway."
           fi
           cd ..
 
-      - name: 配置内核 (GKI 安全规范)
+      - name: Configure kernel (GKI safe)
         run: |
           cd kernel
-          # 1. 生成基础 GKI 配置
           make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 gki_defconfig
-          
-          # 2. 使用 scripts/config 安全地启用 Droidspaces 官方要求的选项
-          # [必需] IPC & Namespaces
           scripts/config --file .config --enable CONFIG_SYSVIPC
           scripts/config --file .config --enable CONFIG_POSIX_MQUEUE
           scripts/config --file .config --enable CONFIG_NAMESPACES
@@ -83,65 +72,49 @@ jobs:
           scripts/config --file .config --enable CONFIG_UTS_NS
           scripts/config --file .config --enable CONFIG_IPC_NS
           scripts/config --file .config --enable CONFIG_USER_NS
-          
-          # [必需] Seccomp & Core Container
           scripts/config --file .config --enable CONFIG_SECCOMP
           scripts/config --file .config --enable CONFIG_SECCOMP_FILTER
           scripts/config --file .config --enable CONFIG_CGROUPS
           scripts/config --file .config --enable CONFIG_DEVTMPFS
           scripts/config --file .config --enable CONFIG_OVERLAY_FS
           scripts/config --file .config --enable CONFIG_BLK_DEV_LOOP
-          
-          # [必需] Networking
           scripts/config --file .config --enable CONFIG_NET_NS
           scripts/config --file .config --enable CONFIG_VETH
           scripts/config --file .config --enable CONFIG_BRIDGE
-                    # [推荐] 增强选项
           scripts/config --file .config --enable CONFIG_NETFILTER_XT_MATCH_ADDRTYPE
           scripts/config --file .config --enable CONFIG_IP6_NF_NAT
           scripts/config --file .config --enable CONFIG_IP6_NF_TARGET_MASQUERADE
           scripts/config --file .config --enable CONFIG_MACVLAN
           scripts/config --file .config --enable CONFIG_TMPFS_POSIX_ACL
           scripts/config --file .config --enable CONFIG_TMPFS_XATTR
-
-          # 3. 启用 KernelSU (如果选择)
           if [[ "${{ inputs.ksu_type }}" == "ksunext" ]]; then
             scripts/config --file .config --enable CONFIG_KSU
             scripts/config --file .config --set-str CONFIG_KSU_EXPECTED_SIZE 0x0
             scripts/config --file .config --set-str CONFIG_KSU_EXPECTED_HASH ""
           fi
-
-          # 4. 应用最终配置 (智能处理依赖关系)
           make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
 
-      - name: 编译内核
+      - name: Build kernel
         run: |
-          cd kernel
-          echo "开始编译内核，这可能需要 20-30 分钟..."
+          cd kernel          echo "Building kernel, this may take 20-30 minutes..."
           make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 -j$(nproc)
 
-      - name: 准备 AnyKernel3 打包
+      - name: Prepare AnyKernel3
         run: |
           git clone https://github.com/osm0sis/AnyKernel3.git AK3
           rm -rf AK3/.git* AK3/README.md
-          
-          # 复制编译生成的 Image 文件
           find kernel/arch/arm64/boot -name "Image" -exec cp {} AK3/ \;
-          
-          # 配置 AnyKernel3 以精准匹配 hummer (PKR110)
           sed -i 's/device.name1=.*/device.name1=hummer/' AK3/anykernel.sh
           sed -i 's/device.name2=.*/device.name2=PKR110/' AK3/anykernel.sh
           sed -i 's/do.systemless=1/do.systemless=0/' AK3/anykernel.sh
-          # 确保 block 自动检测
-          sed -i 's/block=auto/block=auto/' AK3/anykernel.sh
 
-      - name: 打包 AnyKernel3 Zip
+      - name: Package AnyKernel3 zip
         run: |
           cd AK3
           zip -r9 ../LineageOS_hummer_Droidspaces_AK3.zip *
           cd ..
 
-      - name: 上传编译产物
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: LineageOS_hummer_Droidspaces_AK3
