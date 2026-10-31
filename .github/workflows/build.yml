@@ -1,4 +1,4 @@
-name: Build LineageOS Kernel for hummer (PKR110)
+name: Build LineageOS Kernel for hummer (PKR110) - GKI Safe
 
 on:
   workflow_dispatch:
@@ -14,18 +14,14 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          # 添加了 lld 链接器，解决 ld.lld not found 问题
-          sudo apt-get install -y git curl python3 build-essential bc bison flex libssl-dev libelf-dev lz4 zstd zip unzip lld
+          sudo apt-get install -y git curl python3 build-essential bc bison flex libssl-dev libelf-dev lz4 zstd zip unzip lld patch
 
       - name: Setup Clang Toolchain
         run: |
           mkdir -p toolchain
           cd toolchain
-          # 下载 Android 官方 Clang 工具链
           curl -L -o clang.tar.gz "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r522817.tar.gz"
           tar -xzf clang.tar.gz
-          
-          # 将工具链路径加入环境变量，确保 make 能找到 clang 和 ld.lld
           echo "$(pwd)/bin" >> $GITHUB_PATH
           echo "CLANG_PATH=$(pwd)/bin" >> $GITHUB_ENV
 
@@ -39,31 +35,70 @@ jobs:
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
           cd ..
 
-      - name: Configure Kernel for Droidspaces & KernelSU
+      - name: Apply Droidspaces kABI Patches (Critical for GKI)
         run: |
           cd kernel
-          make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 gki_defconfig vendor/oplus/sun_perf.config
+          # 下载官方针对 5.4 - 6.6 GKI 内核的 kABI 修复补丁
+          wget -q https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
           
-          echo "CONFIG_KSU=y" >> .config
-          echo "CONFIG_KSU_EXPECTED_SIZE=0x0" >> .config
-          echo "CONFIG_KSU_EXPECTED_HASH=\"\"" >> .config
-          echo "CONFIG_CGROUPS=y" >> .config
-          echo "CONFIG_CGROUP_V1=y" >> .config
-          echo "CONFIG_CGROUP_V2=y" >> .config
-          echo "CONFIG_NAMESPACES=y" >> .config
-          echo "CONFIG_PID_NS=y" >> .config
-          echo "CONFIG_NET_NS=y" >> .config
-          echo "CONFIG_IPC_NS=y" >> .config
-          echo "CONFIG_UTS_NS=y" >> .config
-          echo "CONFIG_CGROUP_NS=y" >> .config
-          echo "CONFIG_OVERLAY_FS=y" >> .config
-          echo "CONFIG_VETH=y" >> .config
-          echo "CONFIG_BRIDGE=y" >> .config
-          echo "CONFIG_BRIDGE_NETFILTER=y" >> .config
-          echo "CONFIG_SECCOMP=y" >> .config
-          echo "CONFIG_BLK_DEV_LOOP=y" >> .config
-          echo "CONFIG_HUMMER_DTB=y" >> .config
+          # 尝试应用补丁。如果失败，脚本会退出，阻止编译危险内核 (熔断机制)
+          echo "Applying kABI patch..."
+          if ! patch -p1 < 001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch; then
+            echo "ERROR: kABI patch failed to apply. Aborting build to prevent bootloop risk."
+            exit 1
+          fi
+          cd ..
+      - name: Configure Kernel for Droidspaces & KernelSU (GKI Safe)
+        run: |
+          cd kernel
+          # 1. 生成基础 GKI 配置
+          make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 gki_defconfig
+          
+          # 2. 使用 scripts/config 安全地启用 Droidspaces 官方要求的选项
+          # [必需] IPC & Namespaces (文档第2步 + 检查表格)
+          scripts/config --file .config --enable CONFIG_SYSVIPC
+          scripts/config --file .config --enable CONFIG_POSIX_MQUEUE
+          scripts/config --file .config --enable CONFIG_NAMESPACES
+          scripts/config --file .config --enable CONFIG_PID_NS
+          scripts/config --file .config --enable CONFIG_UTS_NS
+          scripts/config --file .config --enable CONFIG_IPC_NS
+          scripts/config --file .config --enable CONFIG_USER_NS
+          
+          # [必需] Seccomp (文档检查表格)
+          scripts/config --file .config --enable CONFIG_SECCOMP
+          scripts/config --file .config --enable CONFIG_SECCOMP_FILTER
+          
+          # [必需] Core Container Features (文档检查表格)
+          scripts/config --file .config --enable CONFIG_CGROUPS
+          scripts/config --file .config --enable CONFIG_DEVTMPFS
+          scripts/config --file .config --enable CONFIG_OVERLAY_FS
+          scripts/config --file .config --enable CONFIG_BLK_DEV_LOOP
+          
+          # [必需] Networking (文档检查表格)
+          scripts/config --file .config --enable CONFIG_NET_NS
+          scripts/config --file .config --enable CONFIG_VETH
+          scripts/config --file .config --enable CONFIG_BRIDGE
+          
+          # [推荐] 文档第2步明确列出的增强选项
+          scripts/config --file .config --enable CONFIG_NETFILTER_XT_MATCH_ADDRTYPE
+          scripts/config --file .config --enable CONFIG_IP6_NF_NAT
+          scripts/config --file .config --enable CONFIG_IP6_NF_TARGET_MASQUERADE
+          scripts/config --file .config --enable CONFIG_MACVLAN
+          scripts/config --file .config --enable CONFIG_NETFILTER_XT_TARGET_REJECT
+          scripts/config --file .config --enable CONFIG_NETFILTER_XT_TARGET_LOG
+          scripts/config --file .config --enable CONFIG_NETFILTER_XT_MATCH_RECENT
+          scripts/config --file .config --enable CONFIG_IP_SET
+          scripts/config --file .config --enable CONFIG_IP_SET_HASH_IP
+          scripts/config --file .config --enable CONFIG_IP_SET_HASH_NET
+          scripts/config --file .config --enable CONFIG_NETFILTER_XT_SET
+          scripts/config --file .config --enable CONFIG_TMPFS_POSIX_ACL
+          scripts/config --file .config --enable CONFIG_TMPFS_XATTR
 
+          # 3. 启用 KernelSU
+          scripts/config --file .config --enable CONFIG_KSU
+          scripts/config --file .config --set-str CONFIG_KSU_EXPECTED_SIZE 0x0          scripts/config --file .config --set-str CONFIG_KSU_EXPECTED_HASH ""
+
+          # 4. 应用最终配置 (智能处理依赖关系，不会破坏 ABI)
           make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
 
       - name: Build Kernel
@@ -76,6 +111,8 @@ jobs:
           git clone https://github.com/osm0sis/AnyKernel3.git AK3
           rm -rf AK3/.git* AK3/README.md
           find kernel/arch/arm64/boot -name "Image" -exec cp {} AK3/ \;
+          
+          # 配置 AnyKernel3 以适配 LineageOS hummer
           sed -i 's/device.name1=.*/device.name1=hummer/' AK3/anykernel.sh
           sed -i 's/device.name2=.*/device.name2=PKR110/' AK3/anykernel.sh
           sed -i 's/do.systemless=1/do.systemless=0/' AK3/anykernel.sh
