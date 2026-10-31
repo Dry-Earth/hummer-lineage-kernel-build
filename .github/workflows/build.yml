@@ -43,14 +43,11 @@ jobs:
       - name: Clone LineageOS kernel source (with sibling repos)
         run: |
           git clone https://github.com/LineageOS/android_kernel_oneplus_sm8750.git kernel --depth=1 --branch lineage-23.2
-          # The kernel tree contains symlinks pointing to sibling repos.
-          # They MUST be cloned next to the kernel dir, otherwise Kconfig parsing fails.
           git clone --depth=1 --branch lineage-23.2 https://github.com/LineageOS/android_kernel_oneplus_sm8750-modules.git sm8750-modules || git clone --depth=1 https://github.com/LineageOS/android_kernel_oneplus_sm8750-modules.git sm8750-modules
           git clone --depth=1 --branch lineage-23.2 https://github.com/LineageOS/android_kernel_oneplus_sm8750-devicetrees.git sm8750-devicetrees || git clone --depth=1 https://github.com/LineageOS/android_kernel_oneplus_sm8750-devicetrees.git sm8750-devicetrees
-          # Verify the critical symlink now resolves          ls -l kernel/drivers/base/kernelFwUpdate/
+          ls -l kernel/drivers/base/kernelFwUpdate/
 
-      - name: Inject KernelSU Next
-        if: inputs.ksu_type == 'ksunext'
+      - name: Inject KernelSU Next        if: inputs.ksu_type == 'ksunext'
         run: |
           cd kernel
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
@@ -69,38 +66,37 @@ jobs:
           echo "kABI patch applied successfully."
           cd ..
 
-      - name: Configure kernel (GKI safe)
+      - name: Configure kernel (GKI safe, portable method)
         run: |
           cd kernel
           make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 gki_defconfig
-          scripts/config --file .config --enable CONFIG_SYSVIPC
-          scripts/config --file .config --enable CONFIG_POSIX_MQUEUE
-          scripts/config --file .config --enable CONFIG_NAMESPACES
-          scripts/config --file .config --enable CONFIG_PID_NS
-          scripts/config --file .config --enable CONFIG_UTS_NS
-          scripts/config --file .config --enable CONFIG_IPC_NS
-          scripts/config --file .config --enable CONFIG_USER_NS
-          scripts/config --file .config --enable CONFIG_SECCOMP
-          scripts/config --file .config --enable CONFIG_SECCOMP_FILTER
-          scripts/config --file .config --enable CONFIG_CGROUPS
-          scripts/config --file .config --enable CONFIG_DEVTMPFS
-          scripts/config --file .config --enable CONFIG_OVERLAY_FS
-          scripts/config --file .config --enable CONFIG_BLK_DEV_LOOP
-          scripts/config --file .config --enable CONFIG_NET_NS
-          scripts/config --file .config --enable CONFIG_VETH
-          scripts/config --file .config --enable CONFIG_BRIDGE
-          scripts/config --file .config --enable CONFIG_NETFILTER_XT_MATCH_ADDRTYPE
-          scripts/config --file .config --enable CONFIG_IP6_NF_NAT
-          scripts/config --file .config --enable CONFIG_IP6_NF_TARGET_MASQUERADE
-          scripts/config --file .config --enable CONFIG_MACVLAN
-          scripts/config --file .config --enable CONFIG_TMPFS_POSIX_ACL
-          scripts/config --file .config --enable CONFIG_TMPFS_XATTR
+          enable_opt() {
+            if grep -q "^# $1 is not set" .config; then
+              sed -i "s|^# $1 is not set|$1=y|" .config
+            elif ! grep -q "^$1=" .config; then
+              echo "$1=y" >> .config
+            fi
+            echo "enabled: $1"
+          }
+          for opt in CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE CONFIG_NAMESPACES CONFIG_PID_NS CONFIG_UTS_NS CONFIG_IPC_NS CONFIG_USER_NS CONFIG_SECCOMP CONFIG_SECCOMP_FILTER CONFIG_CGROUPS CONFIG_DEVTMPFS CONFIG_OVERLAY_FS CONFIG_BLK_DEV_LOOP CONFIG_NET_NS CONFIG_VETH CONFIG_BRIDGE CONFIG_NETFILTER_XT_MATCH_ADDRTYPE CONFIG_IP6_NF_NAT CONFIG_IP6_NF_TARGET_MASQUERADE CONFIG_MACVLAN CONFIG_TMPFS_POSIX_ACL CONFIG_TMPFS_XATTR; do
+            enable_opt $opt
+          done
           if [[ "${{ inputs.ksu_type }}" == "ksunext" ]]; then
-            scripts/config --file .config --enable CONFIG_KSU            scripts/config --file .config --set-str CONFIG_KSU_EXPECTED_SIZE 0x0
-            scripts/config --file .config --set-str CONFIG_KSU_EXPECTED_HASH ""
+            enable_opt CONFIG_KSU
+            if grep -q "^CONFIG_KSU_EXPECTED_SIZE=" .config; then
+              sed -i 's|^CONFIG_KSU_EXPECTED_SIZE=.*|CONFIG_KSU_EXPECTED_SIZE=0x0|' .config
+            else
+              echo "CONFIG_KSU_EXPECTED_SIZE=0x0" >> .config
+            fi
+            if grep -q "^CONFIG_KSU_EXPECTED_HASH=" .config; then
+              sed -i 's|^CONFIG_KSU_EXPECTED_HASH=.*|CONFIG_KSU_EXPECTED_HASH=""|' .config
+            else
+              echo 'CONFIG_KSU_EXPECTED_HASH=""' >> .config
+            fi
           fi
           make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
-
+          echo "--- verify critical options ---"
+          grep -E "CONFIG_(SYSVIPC|IPC_NS|PID_NS|OVERLAY_FS|KSU)=" .config || true
       - name: Build kernel
         run: |
           cd kernel
