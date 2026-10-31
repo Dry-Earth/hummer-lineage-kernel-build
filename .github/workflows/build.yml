@@ -20,13 +20,13 @@ jobs:
         run: |
           mkdir -p toolchain
           cd toolchain
-          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r487747c.tar.gz
-          tar -xzf clang-r487747c.tar.gz
+          curl -L -o clang.tar.gz "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r522817.tar.gz"
+          tar -xzf clang.tar.gz
           echo "CLANG_PATH=$(pwd)/bin" >> $GITHUB_ENV
+          echo "CLANG_PATH=$(pwd)/bin" >> $GITHUB_PATH
 
       - name: Clone LineageOS Kernel Source
         run: |
-          # 关键修改：使用 lineage-23.2 分支以匹配您的 ROM
           git clone https://github.com/LineageOS/android_kernel_oneplus_sm8750.git kernel --depth=1 --branch lineage-23.2
 
       - name: Inject KernelSU-Next
@@ -38,10 +38,8 @@ jobs:
       - name: Configure Kernel for Droidspaces & KernelSU
         run: |
           cd kernel
-          # 使用 LineageOS 官方指定的 hummer 内核配置组合
           make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 gki_defconfig vendor/oplus/sun_perf.config
           
-          # 追加 Droidspaces (LXC容器) 和 KernelSU 必需的内核配置
           echo "CONFIG_KSU=y" >> .config
           echo "CONFIG_KSU_EXPECTED_SIZE=0x0" >> .config
           echo "CONFIG_KSU_EXPECTED_HASH=\"\"" >> .config
@@ -62,7 +60,6 @@ jobs:
           echo "CONFIG_BLK_DEV_LOOP=y" >> .config
           echo "CONFIG_HUMMER_DTB=y" >> .config
 
-          # 应用修改后的配置
           make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
 
       - name: Build Kernel
@@ -74,11 +71,7 @@ jobs:
         run: |
           git clone https://github.com/osm0sis/AnyKernel3.git AK3
           rm -rf AK3/.git* AK3/README.md
-          
-          # 复制编译生成的 Image 文件
           find kernel/arch/arm64/boot -name "Image" -exec cp {} AK3/ \;
-          
-          # 配置 AnyKernel3 以适配 LineageOS hummer
           sed -i 's/device.name1=.*/device.name1=hummer/' AK3/anykernel.sh
           sed -i 's/device.name2=.*/device.name2=PKR110/' AK3/anykernel.sh
           sed -i 's/do.systemless=1/do.systemless=0/' AK3/anykernel.sh
