@@ -10,8 +10,9 @@ on:
         description: 'KernelSU branch'
         required: true
         type: choice
-        default: 'ksunext'
+        default: 'ksu'
         options:
+          - 'ksu'
           - 'ksunext'
           - 'none'
       droidspaces_enable:
@@ -47,11 +48,17 @@ jobs:
           git clone --depth=1 --branch lineage-23.2 https://github.com/LineageOS/android_kernel_oneplus_sm8750-devicetrees.git sm8750-devicetrees || git clone --depth=1 https://github.com/LineageOS/android_kernel_oneplus_sm8750-devicetrees.git sm8750-devicetrees
           ls -l kernel/drivers/base/kernelFwUpdate/
 
-      - name: Inject KernelSU Next
-        if: inputs.ksu_type == 'ksunext'
+      - name: Inject KernelSU
+        if: inputs.ksu_type != 'none'
         run: |
           cd kernel
-          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
+          if [[ "${{ inputs.ksu_type }}" == "ksu" ]]; then
+            echo "Injecting original KernelSU (tiann/KernelSU)..."
+            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -
+          elif [[ "${{ inputs.ksu_type }}" == "ksunext" ]]; then
+            echo "Injecting KernelSU Next..."
+            curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -
+          fi
           cd ..
 
       - name: Apply Droidspaces GKI kABI patch
@@ -82,33 +89,63 @@ jobs:
           for opt in CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE CONFIG_NAMESPACES CONFIG_PID_NS CONFIG_UTS_NS CONFIG_IPC_NS CONFIG_USER_NS CONFIG_SECCOMP CONFIG_SECCOMP_FILTER CONFIG_CGROUPS CONFIG_DEVTMPFS CONFIG_OVERLAY_FS CONFIG_BLK_DEV_LOOP CONFIG_NET_NS CONFIG_VETH CONFIG_BRIDGE CONFIG_NETFILTER_XT_MATCH_ADDRTYPE CONFIG_IP6_NF_NAT CONFIG_IP6_NF_TARGET_MASQUERADE CONFIG_MACVLAN CONFIG_TMPFS_POSIX_ACL CONFIG_TMPFS_XATTR; do
             enable_opt $opt
           done
-          if [[ "${{ inputs.ksu_type }}" == "ksunext" ]]; then
+          
+          if [[ "${{ inputs.ksu_type }}" != "none" ]]; then
             enable_opt CONFIG_KSU
-            if grep -q "^CONFIG_KSU_EXPECTED_SIZE=" .config; then
-              sed -i 's|^CONFIG_KSU_EXPECTED_SIZE=.*|CONFIG_KSU_EXPECTED_SIZE=0x0|' .config
-            else
-              echo "CONFIG_KSU_EXPECTED_SIZE=0x0" >> .config
-            fi
-            if grep -q "^CONFIG_KSU_EXPECTED_HASH=" .config; then
-              sed -i 's|^CONFIG_KSU_EXPECTED_HASH=.*|CONFIG_KSU_EXPECTED_HASH=""|' .config
-            else
-              echo 'CONFIG_KSU_EXPECTED_HASH=""' >> .config
+            if [[ "${{ inputs.ksu_type }}" == "ksunext" ]]; then
+              if grep -q "^CONFIG_KSU_EXPECTED_SIZE=" .config; then
+                sed -i 's|^CONFIG_KSU_EXPECTED_SIZE=.*|CONFIG_KSU_EXPECTED_SIZE=0x0|' .config
+              else
+                echo "CONFIG_KSU_EXPECTED_SIZE=0x0" >> .config
+              fi
+              if grep -q "^CONFIG_KSU_EXPECTED_HASH=" .config; then
+                sed -i 's|^CONFIG_KSU_EXPECTED_HASH=.*|CONFIG_KSU_EXPECTED_HASH=""|' .config
+              else
+                echo 'CONFIG_KSU_EXPECTED_HASH=""' >> .config
+              fi
             fi
           fi
+          
           make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
           echo "--- verify critical options ---"
           grep -E "CONFIG_(SYSVIPC|IPC_NS|PID_NS|OVERLAY_FS|KSU)=" .config || true
+
       - name: Build kernel
         run: |
           cd kernel
           echo "Building kernel, this may take 20-30 minutes..."
           make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 -j$(nproc)
 
-      - name: Prepare AnyKernel3
+      - name: Prepare AnyKernel3 (Fixed Image Copy)
         run: |
           git clone https://github.com/osm0sis/AnyKernel3.git AK3
           rm -rf AK3/.git* AK3/README.md
-          find kernel/arch/arm64/boot -name "Image" -exec cp {} AK3/ \;
+          
+          echo "Searching for compiled kernel Image..."
+          # 明确检查 LineageOS 编译输出的标准路径
+          if [ -f "kernel/arch/arm64/boot/Image" ]; then
+            echo "✅ Found Image at kernel/arch/arm64/boot/Image"
+            cp kernel/arch/arm64/boot/Image AK3/Image
+          elif [ -f "kernel/out/arch/arm64/boot/Image" ]; then
+            echo "✅ Found Image at kernel/out/arch/arm64/boot/Image"
+            cp kernel/out/arch/arm64/boot/Image AK3/Image
+          else
+            echo "❌ FATAL ERROR: Kernel Image not found in expected paths!"
+            echo "Listing contents of kernel/arch/arm64/boot/:"
+            ls -la kernel/arch/arm64/boot/ || true
+            exit 1
+          fi
+          
+          # 验证复制是否成功
+          if [ ! -f "AK3/Image" ]; then
+            echo "❌ FATAL ERROR: Failed to copy Image to AK3 directory!"
+            exit 1
+          fi
+          
+          echo "✅ Image file successfully prepared. Size:"
+          ls -lh AK3/Image
+          
+          # 配置 AnyKernel3 脚本
           sed -i 's/device.name1=.*/device.name1=hummer/' AK3/anykernel.sh
           sed -i 's/device.name2=.*/device.name2=PKR110/' AK3/anykernel.sh
           sed -i 's/do.systemless=1/do.systemless=0/' AK3/anykernel.sh
