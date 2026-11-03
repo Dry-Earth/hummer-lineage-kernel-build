@@ -54,9 +54,10 @@ jobs:
       - name: 下载 LineageOS 官方 boot.img 作为模板
         run: |
           echo "正在下载 LineageOS 官方 boot.img..."
-          curl -fLo stock_boot.img "${{ env.OFFICIAL_BOOT_URL }}"
-          if [ ! -f "stock_boot.img" ]; then
-            echo "::error::下载 stock_boot.img 失败"
+          # [优化] 加上 -f 防错误页面，-C - 支持断点续传
+          curl -f -L -C - --retry 3 --retry-delay 5 -o stock_boot.img "${{ env.OFFICIAL_BOOT_URL }}"
+          if [ ! -f "stock_boot.img" ] || [ ! -s "stock_boot.img" ]; then
+            echo "::error::下载 stock_boot.img 失败或文件为空"
             exit 1
           fi
           echo "✅ 官方 boot.img 下载成功"
@@ -84,29 +85,28 @@ jobs:
           echo "正在下载 LineageOS 官方 LLVM/Clang (r547379)..."
           mkdir -p clang18
           
-          # [核心修复] 使用 aria2c 下载并添加文件大小校验
-          # LineageOS 的 Clang 工具链应该 > 500MB，如果小于此值说明下载不完整
+          # [核心优化] 采纳建议：加入 -f 拦截 HTTP 错误，加入 -C - 支持断点续传
           MAX_RETRIES=3
           RETRY_COUNT=0
           DOWNLOAD_SUCCESS=false
           
           while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$DOWNLOAD_SUCCESS" = false ]; do
             echo "尝试下载 Clang 工具链 (第 $((RETRY_COUNT + 1)) 次)..."
-            aria2c -s 16 -x 16 -k 1M \
-              --file-allocation=none \
-              --retry-wait=5 \
-              https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android16-qpr2-release/clang-r547379.tar.gz \
-              -o clang-r547379.tar.gz
             
-            # 检查文件大小（应该 > 500MB = 524288000 bytes）
-            FILE_SIZE=$(stat -c%s clang-r547379.tar.gz 2>/dev/null || echo "0")
-            MIN_SIZE=524288000
+            # -f: 遇到 404/500 直接失败，不下载错误页面
+            # -C -: 断点续传，网络中断后接着下
+            # --retry 3: curl 自带重试机制
+            curl -f -L -C - --retry 3 --retry-delay 5 --retry-connrefused \
+              -o clang-r547379.tar.gz \
+              https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android16-qpr2-release/clang-r547379.tar.gz
             
-            if [ "$FILE_SIZE" -gt "$MIN_SIZE" ]; then
-              echo "✅ 下载完成，文件大小：$((FILE_SIZE / 1024 / 1024)) MB"
+            # 验证文件完整性
+            echo "正在验证文件完整性..."
+            if tar -tzf clang-r547379.tar.gz > /dev/null 2>&1; then
+              echo "✅ 文件完整性验证通过"
               DOWNLOAD_SUCCESS=true
             else
-              echo "❌ 文件不完整，大小仅 $((FILE_SIZE / 1024 / 1024)) MB，删除后重试..."
+              echo "❌ 文件损坏或为错误页面，删除后重试..."
               rm -f clang-r547379.tar.gz
               RETRY_COUNT=$((RETRY_COUNT + 1))
               sleep 5
@@ -279,6 +279,7 @@ jobs:
           fi
           
           echo "正在下载 Magisk APK: $MAGISK_APK_URL"
+          # [优化] 加上 -f 防止下载错误页面
           curl -fLO "$MAGISK_APK_URL"
           MAGISK_APK_FILE=$(basename "$MAGISK_APK_URL")
           
