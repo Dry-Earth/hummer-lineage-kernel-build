@@ -54,7 +54,7 @@ jobs:
       - name: 下载 LineageOS 官方 boot.img 作为模板
         run: |
           echo "正在下载 LineageOS 官方 boot.img..."
-          curl -Lo stock_boot.img "${{ env.OFFICIAL_BOOT_URL }}"
+          curl -fLo stock_boot.img "${{ env.OFFICIAL_BOOT_URL }}"
           if [ ! -f "stock_boot.img" ]; then
             echo "::error::下载 stock_boot.img 失败"
             exit 1
@@ -83,14 +83,21 @@ jobs:
 
           echo "正在下载 LineageOS 官方 LLVM/Clang (r547379)..."
           mkdir -p clang18
-          curl -LO https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android16-qpr2-release/clang-r547379.tar.gz
+          
+          # [核心修复] 使用 aria2c 替代 curl 下载大文件，支持多线程和断点续传，防止网络波动导致文件不完整
+          aria2c -s 16 -x 16 -k 1M \
+            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android16-qpr2-release/clang-r547379.tar.gz \
+            -o clang-r547379.tar.gz
+            
+          echo "正在解压 Clang 工具链..."
           tar -xzf clang-r547379.tar.gz -C clang18
           rm -f clang-r547379.tar.gz
           
           if [ ! -f "clang18/bin/clang" ]; then
-            echo "::error::Clang 工具链路径异常"
+            echo "::error::Clang 工具链路径异常，未找到 clang18/bin/clang"
             exit 1
           fi
+          echo "✅ 官方 Clang 工具链校验通过"
 
       - name: 计算 ccache 真实 Key
         run: |
@@ -130,7 +137,7 @@ jobs:
           KSUVER=""
           if [[ "${{ inputs.ksu_type }}" == "ksunext" ]]; then
             echo "正在配置 KernelSU Next..."
-            curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${KSUNEXT_REF}/kernel/setup.sh" | bash -s "${KSUNEXT_REF}"
+            curl -fLSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${KSUNEXT_REF}/kernel/setup.sh" | bash -s "${KSUNEXT_REF}"
             cd KernelSU-Next
             rm -rf .git || true
             COMMIT_COUNT=$(curl -sI "https://api.github.com/repos/KernelSU-Next/KernelSU-Next/commits?sha=${KSUNEXT_REF}&per_page=1" | grep -i "link:" | sed -n 's/.*page=\([0-9]*\)>; rel="last".*/\1/p')
@@ -148,7 +155,7 @@ jobs:
         if: inputs.enable_droidspaces == true
         run: |
           cd kernel_workspace/common
-          curl -Lo kabi_patch.patch https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
+          curl -fLo kabi_patch.patch https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
           if patch -p1 --dry-run < kabi_patch.patch > /dev/null 2>&1; then
             patch -p1 < kabi_patch.patch
             echo "✅ kABI 补丁应用成功"
@@ -235,7 +242,7 @@ jobs:
           
           # 1. 下载 KernelSU-Next 官方提供的 ksud 工具 (Linux x86_64)
           echo "正在下载 KernelSU-Next 官方 ksud..."
-          curl -LO https://github.com/KernelSU-Next/KernelSU-Next/releases/latest/download/ksud-x86_64-unknown-linux-musl
+          curl -fLO https://github.com/KernelSU-Next/KernelSU-Next/releases/latest/download/ksud-x86_64-unknown-linux-musl
           mv ksud-x86_64-unknown-linux-musl ksud
           chmod +x ksud
           
@@ -247,7 +254,7 @@ jobs:
           
           # 2. 下载 magiskboot (Linux x86_64，从 Magisk APK 中提取)
           echo "正在下载 magiskboot..."
-          curl -LO https://github.com/topjohnwu/Magisk/releases/download/v28.1/Magisk-28100.apk
+          curl -fLO https://github.com/topjohnwu/Magisk/releases/download/v28.1/Magisk-28100.apk
           unzip -j Magisk-28100.apk "lib/x86_64/libmagiskboot.so" -d .
           mv libmagiskboot.so magiskboot
           chmod +x magiskboot
@@ -260,7 +267,7 @@ jobs:
             exit 1
           fi
           
-          # 4. [终极保险] 使用 ksud 修补，并强制指定 KMI 为 android16-6.6，彻底杜绝版本号解析错误
+          # 4. 使用 ksud 修补，并强制指定 KMI 为 android16-6.6，彻底杜绝版本号解析错误
           echo "正在使用 ksud 修补 boot.img (强制 KMI: android16-6.6)..."
           ./ksud boot-patch \
             -b ../stock_boot.img \
