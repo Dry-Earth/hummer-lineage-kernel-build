@@ -9,7 +9,6 @@ env:
   CCACHE_KEY: ccache-lineageos23.2-6.6.144
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   CCACHE_MAXSIZE: 5G
-  # 官方 boot.img 下载链接
   OFFICIAL_BOOT_URL: "https://mirrorbits.lineageos.org/full/hummer/20261009/boot.img"
 
 on:
@@ -235,12 +234,21 @@ jobs:
         run: |
           cd kernel_workspace
           
-          # 1. 获取 magiskboot 工具 (从 AnyKernel3 提取)
-          git clone https://github.com/osm0sis/AnyKernel3 --depth=1 temp_ak3
+          # 1. 下载 Linux x86_64 版本的 magiskboot (从官方 Magisk 发布页)
+          echo "正在下载 magiskboot (Linux x86_64)..."
           mkdir -p tools
-          cp temp_ak3/tools/magiskboot tools/
-          rm -rf temp_ak3
+          curl -Lo magiskboot.zip https://github.com/topjohnwu/Magisk/releases/download/v28.1/Magisk-28100.apk
+          unzip -j magiskboot.zip "lib/x86_64/libmagiskboot.so" -d tools/
+          mv tools/libmagiskboot.so tools/magiskboot
+          rm -f magiskboot.zip
           chmod 755 tools/magiskboot
+          
+          # 验证 magiskboot 是否可执行
+          if ! ./tools/magiskboot --help > /dev/null 2>&1; then
+            echo "::error::magiskboot 无法执行，请确认架构正确"
+            exit 1
+          fi
+          echo "✅ magiskboot 下载成功"
           
           # 2. 复制编译好的内核
           cp common/out/arch/arm64/boot/Image .
