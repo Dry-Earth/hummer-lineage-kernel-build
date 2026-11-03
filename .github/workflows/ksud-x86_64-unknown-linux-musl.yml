@@ -233,7 +233,7 @@ jobs:
           echo "内核编译完成！"
           ccache -s
 
-      - name: 使用 KernelSU-Next 官方 ksud 直接修补 boot.img (强制指定 KMI)
+      - name: 使用 KernelSU-Next 官方 ksud 直接修补 boot.img (GKI 模式)
         id: patch_boot
         if: inputs.ksu_type == 'ksunext'
         run: |
@@ -279,12 +279,12 @@ jobs:
             exit 1
           fi
           
-          # 4. [已修复] 使用 ksud 修补，去掉错误的 --magiskboot 参数
-          echo "正在使用 ksud 修补 boot.img (强制 KMI: android16-6.6)..."
+          # 4. [已修复] 使用 ksud 修补，不指定 --kmi 参数，使用 GKI 模式
+          # 因为我们的内核已经通过 CONFIG_KSU=y 内置了 KernelSU，所以不需要 LKM 模块
+          echo "正在使用 ksud 修补 boot.img (GKI 模式，内核已内置 KSU)..."
           ./ksud boot-patch \
             --boot ../stock_boot.img \
             --kernel Image \
-            --kmi android16-6.6 \
             --out ../patched_boot.img
             
           if [[ ! -f "../patched_boot.img" ]]; then
