@@ -84,9 +84,39 @@ jobs:
           echo "正在下载 LineageOS 官方 LLVM/Clang (r547379)..."
           mkdir -p clang18
           
-          aria2c -s 16 -x 16 -k 1M \
-            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android16-qpr2-release/clang-r547379.tar.gz \
-            -o clang-r547379.tar.gz
+          # [核心修复] 使用 aria2c 下载并添加文件大小校验
+          # LineageOS 的 Clang 工具链应该 > 500MB，如果小于此值说明下载不完整
+          MAX_RETRIES=3
+          RETRY_COUNT=0
+          DOWNLOAD_SUCCESS=false
+          
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$DOWNLOAD_SUCCESS" = false ]; do
+            echo "尝试下载 Clang 工具链 (第 $((RETRY_COUNT + 1)) 次)..."
+            aria2c -s 16 -x 16 -k 1M \
+              --file-allocation=none \
+              --retry-wait=5 \
+              https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android16-qpr2-release/clang-r547379.tar.gz \
+              -o clang-r547379.tar.gz
+            
+            # 检查文件大小（应该 > 500MB = 524288000 bytes）
+            FILE_SIZE=$(stat -c%s clang-r547379.tar.gz 2>/dev/null || echo "0")
+            MIN_SIZE=524288000
+            
+            if [ "$FILE_SIZE" -gt "$MIN_SIZE" ]; then
+              echo "✅ 下载完成，文件大小：$((FILE_SIZE / 1024 / 1024)) MB"
+              DOWNLOAD_SUCCESS=true
+            else
+              echo "❌ 文件不完整，大小仅 $((FILE_SIZE / 1024 / 1024)) MB，删除后重试..."
+              rm -f clang-r547379.tar.gz
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+              sleep 5
+            fi
+          done
+          
+          if [ "$DOWNLOAD_SUCCESS" = false ]; then
+            echo "::error::Clang 工具链下载失败，已重试 $MAX_RETRIES 次"
+            exit 1
+          fi
             
           echo "正在解压 Clang 工具链..."
           tar -xzf clang-r547379.tar.gz -C clang18
