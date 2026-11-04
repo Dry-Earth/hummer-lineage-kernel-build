@@ -1,0 +1,325 @@
+name: LineageOS 23.2 Kernel for hummer (6.6.144) [Extract Config Minimal Patch]
+
+env:
+  TZ: Asia/Shanghai
+  KERNEL_VERSION: '6.6'
+  SUB_VERSION: '144'
+  CCACHE_KEY: ccache-lineageos23.2-6.6.144-extract
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 5G
+  OFFICIAL_BOOT_URL: "https://mirrorbits.lineageos.org/full/hummer/20261009/boot.img"
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    outputs:
+      bootimg_name: ${{ steps.create_bootimg.outputs.bootimg_name }}
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 下载 LineageOS 官方 boot.img
+        run: |
+          curl -f -L -C - --retry 3 --retry-delay 5 -o stock_boot.img "${{ env.OFFICIAL_BOOT_URL }}"
+          ls -la stock_boot.img
+
+      - name: 安装环境依赖 & 初始化源码与工具链
+        run: |
+          sudo apt update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libncurses-dev libncurses5-dev dwarves \
+            libssl-dev libelf-dev aria2 unzip zip git wget ccache patch \
+            gcc-aarch64-linux-gnu jq lz4 zstd
+
+          rm -rf kernel_workspace
+          mkdir kernel_workspace
+          cd kernel_workspace
+
+          cp ../stock_boot.img .
+
+          echo "正在克隆 LineageOS 官方 SM8750 内核源码..."
+          git clone --depth=1 --branch lineage-23.2 https://github.com/LineageOS/android_kernel_oneplus_sm8750.git common
+
+          echo "正在初始化子模块..."
+          cd common
+          git submodule update --init --recursive --depth=1
+          cd ..
+
+          echo "正在下载 LineageOS 官方 LLVM/Clang (r547379)..."
+          mkdir -p clang18
+          curl -f -L -C - --retry 3 --retry-delay 5 --retry-connrefused \
+            -o clang-r547379.tar.gz \
+            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android16-qpr2-release/clang-r547379.tar.gz
+          tar -xzf clang-r547379.tar.gz -C clang18
+          rm -f clang-r547379.tar.gz
+
+          echo "正在下载构建工具..."
+          aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang18-r510928/build-tools.zip -o build-tools.zip
+          unzip -q build-tools.zip
+          rm -rf build-tools.zip
+
+          echo "[微创] 仅去除 dirty 后缀..."
+          for f in common/scripts/setlocalversion; do
+            sed -i 's/ -dirty//g' "$f"
+            sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' "$f"
+          done
+
+      - name: 计算 ccache 真实 Key
+        run: |
+          echo "CCACHE_REAL_KEY=${CCACHE_KEY}-extract" >> "$GITHUB_ENV"
+
+      - name: 载入 ccache 缓存
+        uses: actions/cache@v4
+        id: ccache-restore
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: >-
+            ${{ env.CCACHE_REAL_KEY }}-${{ runner.os }}-${{ github.ref_name }}
+          restore-keys: |
+            ${{ env.CCACHE_REAL_KEY }}-${{ runner.os }}-
+
+      - name: 初始化并配置 ccache
+        run: |
+          {
+            echo "CCACHE_COMPILERCHECK=string:%compiler% -v"
+            echo "CCACHE_BASEDIR=${{ github.workspace }}"
+            echo "CCACHE_NOHASHDIR=true"
+            echo "CCACHE_NOHARDLINK=true"
+          } >> $GITHUB_ENV
+          mkdir -p "${{ env.CCACHE_DIR }}"
+          ccache -M "${{ env.CCACHE_MAXSIZE }}"
+          ccache -o compression=true
+          ccache -s
+
+      - name: 下载 magiskboot 工具（仅用于解包/重打包 boot.img，与 Root 无关）
+        run: |
+          cd kernel_workspace
+          # magiskboot 是 boot.img 解包/重打包工具，仅用于打包内核，
+          # 不会向镜像注入任何 Root 相关代码。
+          curl -fLO https://github.com/topjohnwu/Magisk/releases/latest/download/Magisk.apk
+          unzip -j Magisk.apk "lib/x86_64/libmagiskboot.so" -d .
+          mv libmagiskboot.so magiskboot
+          chmod +x magiskboot
+          rm -f Magisk.apk
+          ./magiskboot --help > /dev/null 2>&1 || true
+          echo "✅ magiskboot 就绪（仅打包工具，非 Root 方案）"
+
+      - name: 应用 Droidspaces kABI 补丁
+        run: |
+          cd kernel_workspace/common
+          echo "========================================="
+          echo "正在应用 Droidspaces GKI kABI 补丁..."
+          echo "========================================="
+          curl -fLo fix_sysvipc_kabi_6_7_8.patch https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
+
+          if patch -p1 -F 3 --dry-run < fix_sysvipc_kabi_6_7_8.patch > /dev/null 2>&1; then
+            patch -p1 -F 3 < fix_sysvipc_kabi_6_7_8.patch
+            echo "✅ kABI 补丁干净应用"
+          else
+            echo "::warning::kABI 补丁无法干净应用，尝试 fuzz 应用..."
+            if patch -p1 -F 3 < fix_sysvipc_kabi_6_7_8.patch; then
+              echo "✅ kABI 补丁（fuzz）应用成功"
+            else
+              echo "::warning::kABI 补丁应用失败。开 IPC_NS 后 kABI 可能不兼容，若刷入后崩溃请检查此补丁。"
+            fi
+          fi
+          rm -f fix_sysvipc_kabi_6_7_8.patch
+
+      - name: 提取原厂配置并执行微创手术
+        run: |
+          WORKDIR="$(pwd)"
+          export PATH="/usr/lib/ccache:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/clang18/bin:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
+          cd kernel_workspace
+
+          echo "正在解包原厂 boot.img..."
+          mkdir -p unpack_dir
+          cd unpack_dir
+          ../magiskboot unpack ../stock_boot.img
+          cd ..
+
+          if [ ! -f unpack_dir/kernel ]; then
+            echo "::error::解包失败，unpack_dir/kernel 不存在"
+            exit 1
+          fi
+          echo "✅ 解包成功，kernel:"
+          ls -la unpack_dir/kernel
+
+          echo "正在用 extract-ikconfig 提取原厂配置..."
+          cd common
+          mkdir -p out
+          ./scripts/extract-ikconfig ../unpack_dir/kernel > out/.config 2>/dev/null || true
+          cd ..
+
+          CONFIG_LINES=$(wc -l < common/out/.config 2>/dev/null || echo "0")
+          if [ "$CONFIG_LINES" -gt 1000 ]; then
+            echo "✅ 成功提取原厂 .config (共 $CONFIG_LINES 行)！"
+            echo "原厂 CONFIG_LOCALVERSION:"
+            grep '^CONFIG_LOCALVERSION=' common/out/.config || echo "  (未设置)"
+            echo "原厂 CONFIG_IKCONFIG:"
+            grep '^CONFIG_IKCONFIG' common/out/.config || echo "  (未设置)"
+          else
+            echo "::warning::未能从原厂 boot.img 提取配置（可能原厂未开启 CONFIG_IKCONFIG 或 kernel 格式不支持）。"
+            echo "正在回退到 gki_defconfig + vendor merge 方案..."
+            cd common
+            make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+              CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out \
+              KCFLAGS+=-O2 KCFLAGS+=-Wno-error gki_defconfig
+            ARCH=arm64 ./scripts/kconfig/merge_config.sh -m -O out \
+              out/.config \
+              arch/arm64/configs/vendor/sun_perf.config \
+              arch/arm64/configs/vendor/oplus/sun_perf.config
+            cd ..
+          fi
+
+          echo "正在执行微创手术：添加 Droidspaces 缺失配置..."
+          ./common/scripts/config --file ./common/out/.config \
+            --enable NAMESPACES \
+            --enable MULTIUSER \
+            --enable PID_NS \
+            --enable IPC_NS \
+            --enable SYSVIPC \
+            --enable POSIX_MQUEUE \
+            --enable DEVTMPFS \
+            --enable IKCONFIG \
+            --enable IKCONFIG_PROC
+
+          cd common
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out olddefconfig
+          cd ..
+
+          echo "正在执行断言检查 (验证 olddefconfig 后的最终配置)..."
+          ASSERT_PASS=true
+          for CONFIG in CONFIG_NAMESPACES CONFIG_MULTIUSER CONFIG_PID_NS CONFIG_IPC_NS CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE CONFIG_DEVTMPFS CONFIG_IKCONFIG CONFIG_IKCONFIG_PROC; do
+            if grep -q "^${CONFIG}=y" common/out/.config; then
+              echo "  [✓] $CONFIG"
+            else
+              echo "  [✗] $CONFIG 未开启！"
+              ASSERT_PASS=false
+            fi
+          done
+
+          if [ "$ASSERT_PASS" = false ]; then
+            echo "::error::断言失败：关键配置未成功写入 .config"
+            exit 1
+          fi
+          echo "✅ 断言检查通过！"
+
+      - name: 编译内核
+        run: |
+          WORKDIR="$(pwd)"
+          export PATH="/usr/lib/ccache:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/clang18/bin:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
+          cd kernel_workspace/common
+
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out \
+            KCFLAGS+=-O2 KCFLAGS+=-Wno-error Image
+
+          echo "内核编译完成！"
+          ccache -s
+          ls -la out/arch/arm64/boot/Image
+
+      - name: 生成 boot.img
+        id: create_bootimg
+        run: |
+          cd kernel_workspace
+
+          cp common/out/arch/arm64/boot/Image unpack_dir/kernel
+
+          cd unpack_dir
+          ../magiskboot repack ../stock_boot.img ../new-boot.img
+          cd ..
+
+          BOOTIMG_NAME="droidspaces-extract-boot.img"
+          mv new-boot.img "${BOOTIMG_NAME}"
+          echo "bootimg_name=${BOOTIMG_NAME}" >> $GITHUB_OUTPUT
+          ls -la "${BOOTIMG_NAME}"
+          echo "✅ boot.img 生成完成！注意：不含 Root，需自行获取 root 权限。"
+
+      - name: 保存 ccache 缓存
+        if: steps.ccache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: >-
+            ${{ env.CCACHE_REAL_KEY }}-${{ runner.os }}-${{ github.ref_name }}
+
+      - name: 上传 boot.img 工件
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.create_bootimg.outputs.bootimg_name }}
+          path: kernel_workspace/${{ steps.create_bootimg.outputs.bootimg_name }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: 下载 boot.img 工件
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.bootimg_name }}
+          path: ./release
+
+      - name: 设置环境变量
+        run: |
+          FULL_VERSION="${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }}"
+          echo "FULL_VERSION=$FULL_VERSION" >> $GITHUB_ENV
+          TIME="$(TZ='Asia/Shanghai' date +'%y%m%d%H%M%S')"
+          echo "TIME=$TIME" >> $GITHUB_ENV
+          echo "TAG_HEAD=LineageOS-23.2-hummer-Droidspaces" >> $GITHUB_ENV
+
+      - name: 创建 Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo '### 📱 LineageOS 23.2 Kernel for hummer (Droidspaces 微创版)'
+            echo ''
+            echo "- **内核版本**: ${{ env.FULL_VERSION }}"
+            echo '- **目标设备**: OnePlus Ace 5 Pro (hummer)'
+            echo '- **变更**: 优先基于原厂 `.config` 提取，仅补 `PID_NS` / `IPC_NS` / `DEVTMPFS` 及其依赖链'
+            echo '- **Root 方案**: **本镜像不含 Root**，需自行获取 root 权限'
+            echo ''
+            echo '### 📱 刷入说明'
+            echo ''
+            echo '1. 下载下方的 `droidspaces-extract-boot.img`。'
+            echo '2. 自行获取 root 权限。'
+            echo '3. 刷入本镜像后重启，确认 root 可用。'
+            echo '4. 运行 Droidspaces。'
+            echo ''
+            echo '### 🔍 刷入后验证'
+            echo '```bash'
+            echo 'su'
+            echo 'zcat /proc/config.gz | grep -E "CONFIG_(NAMESPACES|PID_NS|IPC_NS|SYSVIPC)="'
+            echo 'unshare --pid --fork true; echo "pid_ns=$?"'
+            echo 'unshare --ipc --fork true; echo "ipc_ns=$?"'
+            echo '```'
+            echo ''
+            echo '⚠️ **免责声明**: 刷写第三方内核存在风险。若刷入后无法开机，请通过 fastboot 刷回原厂 boot.img。'
+          } > release_notes.md
+
+          gh release create "${{ env.TAG_HEAD }}-${{ env.TIME }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ env.TAG_HEAD }}-v${{ env.TIME }}" \
+            --notes-file release_notes.md \
+            release/*.img
