@@ -156,39 +156,46 @@ jobs:
           fi
           rm -f fix_sysvipc_kabi_6_7_8.patch
 
-      - name: 克隆并修复内核模块源码 (解决 kernelFwUpdate 缺失)
+      - name: 克隆并修复内核模块源码 (自动清理缺失的 Kconfig)
         run: |
           cd kernel_workspace
           echo "正在克隆 LineageOS SM8750 内核模块源码..."
-          # 尝试拉取 modules 仓库
           git clone --depth=1 --branch lineage-23.2 https://github.com/LineageOS/android_kernel_oneplus_sm8750-modules.git modules || true
 
-          # 精准提取 kernelFwUpdate，绝不全量覆盖！
-          if [ -d "modules/drivers/base/kernelFwUpdate" ]; then
-            echo "✅ 在 modules 仓库中找到 kernelFwUpdate，正在精准复制..."
+          # 如果 modules 仓库里有 drivers/base 下的目录，精准合并过来
+          if [ -d "modules/drivers/base" ]; then
+            echo "发现 modules 源码，正在精准合并..."
             mkdir -p common/drivers/base
-            cp -r modules/drivers/base/kernelFwUpdate common/drivers/base/
-          else
-            echo "::warning::modules 仓库中未找到 kernelFwUpdate，将使用配置移除方案"
+            cp -rn modules/drivers/base/* common/drivers/base/ 2>/dev/null || true
           fi
 
-          # 无论是否找到，为确保 olddefconfig 绝不报错，强制清理 Kconfig 和 Makefile 中的引用
-          # （如果你的确复制了源码，这一步防止某些路径依赖导致的问题；如果没复制，这步就是保底）
+          echo "开始自动清理 common/drivers/base/Kconfig 中不存在的引用..."
           cd common
+          
+          # 自动扫描 Kconfig，移除不存在目录的 source 引用
           if [ -f drivers/base/Kconfig ]; then
-            # 如果目录存在但 Kconfig 报错，或者根本没有目录，删掉引用是最稳妥的
-            # 为了安全起见，我们将 Kconfig 里的 source 行替换为检查目录是否存在的逻辑，或者直接删掉
-            sed -i '/source "drivers\/base\/kernelFwUpdate\/Kconfig"/d' drivers/base/Kconfig
-            echo "已从 drivers/base/Kconfig 中清理 kernelFwUpdate 引用"
+            grep -oP '(?<=source ").*(?=")' drivers/base/Kconfig | while read -r path; do
+              if [ ! -f "$path" ] && [[ "$path" == drivers/base/* ]]; then
+                echo "  -> 发现缺失路径: $path，正在自动移除..."
+                escaped_path=$(echo "$path" | sed 's/\//\\\//g')
+                sed -i "/source \"$escaped_path\"/d" drivers/base/Kconfig
+              fi
+            done
           fi
-          if [ -f drivers/base/Makefile ]; then
-            sed -i '/kernelFwUpdate/d' drivers/base/Makefile
-            echo "已从 drivers/base/Makefile 中清理 kernelFwUpdate 引用"
-          fi
-          cd ..
 
+          # 自动扫描 Makefile，移除不存在目录的 obj-y 引用
+          if [ -f drivers/base/Makefile ]; then
+            grep -oP '(?<=obj-y \+= )[\w\-]+(?=/)' drivers/base/Makefile | sort -u | while read -r dir; do
+              if [ ! -d "drivers/base/$dir" ]; then
+                echo "  -> 发现缺失目录: $dir，正在从 Makefile 移除..."
+                sed -i "/obj-y += $dir\//d" drivers/base/Makefile
+              fi
+            done
+          fi
+
+          cd ..
           rm -rf modules
-          echo "✅ 模块源码处理完成"
+          echo "✅ 缺失的闭源驱动引用已全部自动清理"
 
       - name: 提取原厂配置并执行微创手术
         run: |
