@@ -55,13 +55,37 @@ jobs:
           cd common
           git submodule update --init --recursive --depth=1
           
-          # 【极简修复】直接把缺失的闭源目录引用删掉，保证 make 不会报错
-          echo "正在屏蔽缺失的闭源驱动，避免编译中断..."
-          sed -i '/source "drivers\/base\/kernelFwUpdate\/Kconfig"/d' drivers/base/Kconfig || true
-          sed -i '/source "drivers\/base\/touchpanel_notify\/Kconfig"/d' drivers/base/Kconfig || true
-          sed -i '/kernelFwUpdate/d' drivers/base/Makefile || true
-          sed -i '/touchpanel_notify/d' drivers/base/Makefile || true
+          # 【全自动排雷 2.0】全局扫描并清理缺失的闭源驱动引用
+          echo "========================================="
+          echo "正在全自动清理缺失的闭源驱动引用..."
+          echo "========================================="
           
+          # 1. 清理所有 Kconfig 中的无效 source
+          find . -name "Kconfig" | while read -r kconfig_file; do
+            grep -oP '(?<=source ").*(?=")' "$kconfig_file" 2>/dev/null | while read -r path; do
+              # 忽略包含变量的路径 (如 source "arch/$ARCH/Kconfig")
+              if [[ "$path" == *"$"* ]]; then continue; fi
+              
+              if [ ! -f "$path" ] && [ ! -d "$path" ]; then
+                echo "  -> [$kconfig_file] 发现缺失路径: $path，正在自动移除..."
+                # 转义特殊字符以供 sed 使用
+                escaped_path=$(echo "$path" | sed 's/[]\/$*.^[]/\\&/g')
+                sed -i "/source \"$escaped_path\"/d" "$kconfig_file"
+              fi
+            done
+          done
+
+          # 2. 清理所有 Makefile 中的无效 obj-y/obj-m
+          find . -name "Makefile" | while read -r makefile; do
+            grep -oP '(?<=obj-[ym] \+= )[\w\-]+(?=/)' "$makefile" 2>/dev/null | sort -u | while read -r dir; do
+              makefile_dir=$(dirname "$makefile")
+              if [ ! -d "$makefile_dir/$dir" ]; then
+                echo "  -> [$makefile] 发现缺失目录: $dir，正在从 Makefile 移除..."
+                sed -i "/obj-[ym] += $dir\//d" "$makefile"
+              fi
+            done
+          done
+          echo "✅ 全自动排雷完成！"
           cd ..
 
           echo "正在下载 LineageOS 官方 LLVM/Clang (r547379)..."
