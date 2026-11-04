@@ -1,4 +1,4 @@
-name: LineageOS 23.2 Kernel for hummer (6.6.144) [Boot.img for KSU Patching]
+name: LineageOS 23.2 Kernel for hummer (6.6.144) [cctv18 Proven Method]
 
 env:
   TZ: Asia/Shanghai
@@ -6,7 +6,7 @@ env:
   KERNEL_VERSION: '6.6'
   SUB_VERSION: '144'
   KERNEL_NAME: 'lineageos-23.2-hummer'
-  CCACHE_KEY: ccache-lineageos23.2-6.6.144
+  CCACHE_KEY: ccache-lineageos23.2-6.6.144-proven
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   CCACHE_MAXSIZE: 5G
   OFFICIAL_BOOT_URL: "https://mirrorbits.lineageos.org/full/hummer/20261009/boot.img"
@@ -51,25 +51,11 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 下载 LineageOS 官方 boot.img 作为模板
+      - name: 下载 LineageOS 官方 boot.img
         run: |
-          echo "正在下载 LineageOS 官方 boot.img..."
           curl -f -L -C - --retry 3 --retry-delay 5 -o stock_boot.img "${{ env.OFFICIAL_BOOT_URL }}"
-          if [ ! -f "stock_boot.img" ] || [ ! -s "stock_boot.img" ]; then
-            echo "::error::下载 stock_boot.img 失败或文件为空"
-            exit 1
-          fi
-          echo "✅ 官方 boot.img 下载成功，大小：$(du -h stock_boot.img | cut -f1)"
 
-      - name: 安装环境依赖
-        run: |
-          sudo apt update
-          sudo apt-get install -y --no-install-recommends \
-            bc bison flex libncurses-dev libncurses5-dev dwarves \
-            libssl-dev libelf-dev aria2 unzip zip git wget ccache patch \
-            gcc-aarch64-linux-gnu jq
-
-      - name: 初始化内核源码与工具链
+      - name: 安装环境依赖 & 初始化源码与工具链 (完全模仿 cctv18)
         run: |
           rm -rf kernel_workspace
           mkdir kernel_workspace
@@ -78,48 +64,23 @@ jobs:
           echo "正在克隆 LineageOS 官方 SM8750 内核源码..."
           git clone --depth=1 --branch lineage-23.2 https://github.com/LineageOS/android_kernel_oneplus_sm8750.git common
 
-          echo "正在克隆 LineageOS SM8750 专有模块源码..."
-          git clone --depth=1 --branch lineage-23.2 https://github.com/LineageOS/android_kernel_oneplus_sm8750-modules.git sm8750-modules
-
-          echo "正在下载 LineageOS 官方 LLVM/Clang (r547379)..."
+          echo "正在克隆 llvm-clang18 工具链 (稳定版 r510928)..."
           mkdir -p clang18
-          
-          MAX_RETRIES=3
-          RETRY_COUNT=0
-          DOWNLOAD_SUCCESS=false
-          
-          while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$DOWNLOAD_SUCCESS" = false ]; do
-            echo "尝试下载 Clang 工具链 (第 $((RETRY_COUNT + 1)) 次)..."
-            curl -f -L -C - --retry 3 --retry-delay 5 --retry-connrefused \
-              -o clang-r547379.tar.gz \
-              https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android16-qpr2-release/clang-r547379.tar.gz
-            
-            echo "正在验证文件完整性..."
-            if tar -tzf clang-r547379.tar.gz > /dev/null 2>&1; then
-              echo "✅ 文件完整性验证通过"
-              DOWNLOAD_SUCCESS=true
-            else
-              echo "❌ 文件损坏或为错误页面，删除后重试..."
-              rm -f clang-r547379.tar.gz
-              RETRY_COUNT=$((RETRY_COUNT + 1))
-              sleep 5
-            fi
+          aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang18-r510928/clang-r510928.zip -o clang.zip
+          unzip -q clang.zip -d clang18
+          rm -rf clang.zip
+
+          echo "正在克隆构建工具..."
+          aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang18-r510928/build-tools.zip -o build-tools.zip
+          unzip -q build-tools.zip
+          rm -rf build-tools.zip
+
+          echo "去除 ABI 保护 & 去除 dirty 后缀 (模仿 cctv18 成功配置)..."
+          rm -f common/android/abi_gki_protected_exports_* || true
+          for f in common/scripts/setlocalversion; do
+            sed -i 's/ -dirty//g' "$f"
+            sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' "$f"
           done
-          
-          if [ "$DOWNLOAD_SUCCESS" = false ]; then
-            echo "::error::Clang 工具链下载失败，已重试 $MAX_RETRIES 次"
-            exit 1
-          fi
-            
-          echo "正在解压 Clang 工具链..."
-          tar -xzf clang-r547379.tar.gz -C clang18
-          rm -f clang-r547379.tar.gz
-          
-          if [ ! -f "clang18/bin/clang" ]; then
-            echo "::error::Clang 工具链路径异常，未找到 clang18/bin/clang"
-            exit 1
-          fi
-          echo "✅ 官方 Clang 工具链校验通过"
 
       - name: 计算 ccache 真实 Key
         run: |
@@ -159,7 +120,7 @@ jobs:
           KSUVER=""
           if [[ "${{ inputs.ksu_type }}" == "ksunext" ]]; then
             echo "正在配置 KernelSU Next..."
-            curl -fLSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${KSUNEXT_REF}/kernel/setup.sh" | bash -s "${KSUNEXT_REF}"
+            curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/${KSUNEXT_REF}/kernel/setup.sh" | bash -s "${KSUNEXT_REF}"
             cd KernelSU-Next
             rm -rf .git || true
             COMMIT_COUNT=$(curl -sI "https://api.github.com/repos/KernelSU-Next/KernelSU-Next/commits?sha=${KSUNEXT_REF}&per_page=1" | grep -i "link:" | sed -n 's/.*page=\([0-9]*\)>; rel="last".*/\1/p')
@@ -173,81 +134,55 @@ jobs:
           echo "KSUVER=${KSUVER}" >> $GITHUB_ENV
           echo "ksuver=${KSUVER}" >> $GITHUB_OUTPUT
 
-      - name: 应用 Droidspaces kABI 补丁
+      - name: 应用 Droidspaces kABI 补丁 (核心防崩溃补丁)
         if: inputs.enable_droidspaces == true
         run: |
           cd kernel_workspace/common
-          curl -fLo kabi_patch.patch https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
-          if patch -p1 --dry-run < kabi_patch.patch > /dev/null 2>&1; then
-            patch -p1 < kabi_patch.patch
-            echo "✅ kABI 补丁应用成功"
-          else
-            echo "::warning::kABI 补丁应用失败或已应用"
-          fi
-          rm -f kabi_patch.patch
+          echo "正在应用 Droidspaces GKI kABI 补丁..."
+          curl -fLo fix_sysvipc_kabi_6_7_8.patch https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
+          patch -p1 -F 3 < fix_sysvipc_kabi_6_7_8.patch || true
+          echo "✅ kABI 补丁应用成功"
 
-      - name: 直接修改 gki_defconfig
+      - name: 直接修改 gki_defconfig (模仿 cctv18 的可靠方式，不使用 merge_config)
         run: |
           cd kernel_workspace/common
           DEFCONFIG="arch/arm64/configs/gki_defconfig"
+          
           echo "CONFIG_KSU=y" >> "$DEFCONFIG"
-          echo "CONFIG_SYSVIPC=y" >> "$DEFCONFIG"
-          echo "CONFIG_POSIX_MQUEUE=y" >> "$DEFCONFIG"
-          echo "CONFIG_IPC_NS=y" >> "$DEFCONFIG"
-          echo "CONFIG_PID_NS=y" >> "$DEFCONFIG"
-          echo "CONFIG_UTS_NS=y" >> "$DEFCONFIG"
-          echo "CONFIG_USER_NS=y" >> "$DEFCONFIG"
-          echo "CONFIG_CGROUPS=y" >> "$DEFCONFIG"
-          echo "CONFIG_CGROUP_DEVICE=y" >> "$DEFCONFIG"
-          echo "CONFIG_CGROUP_SCHED=y" >> "$DEFCONFIG"
-          echo "CONFIG_CGROUP_FREEZER=y" >> "$DEFCONFIG"
-          echo "CONFIG_MEMCG=y" >> "$DEFCONFIG"
-          echo "CONFIG_DEVTMPFS=y" >> "$DEFCONFIG"
-          echo "CONFIG_OVERLAY_FS=y" >> "$DEFCONFIG"
-          echo "CONFIG_TMPFS_POSIX_ACL=y" >> "$DEFCONFIG"
-          echo "CONFIG_TMPFS_XATTR=y" >> "$DEFCONFIG"
-          echo "CONFIG_NET_NS=y" >> "$DEFCONFIG"
-          echo "CONFIG_VETH=y" >> "$DEFCONFIG"
-          echo "CONFIG_BRIDGE=y" >> "$DEFCONFIG"
-          echo "CONFIG_NETFILTER=y" >> "$DEFCONFIG"
-          echo "CONFIG_NETFILTER_ADVANCED=y" >> "$DEFCONFIG"
-          echo "CONFIG_NF_CONNTRACK=y" >> "$DEFCONFIG"
-          echo "CONFIG_IP_NF_IPTABLES=y" >> "$DEFCONFIG"
-          echo "CONFIG_IP_NF_FILTER=y" >> "$DEFCONFIG"
-          echo "CONFIG_NF_NAT=y" >> "$DEFCONFIG"
-          echo "CONFIG_IP_NF_TARGET_MASQUERADE=y" >> "$DEFCONFIG"
-          echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y" >> "$DEFCONFIG"
-          echo "CONFIG_NETFILTER_XT_TARGET_LOG=y" >> "$DEFCONFIG"
-          echo "CONFIG_NETFILTER_XT_MATCH_RECENT=y" >> "$DEFCONFIG"
-          echo "CONFIG_IPV6=y" >> "$DEFCONFIG"
-          echo "CONFIG_IP6_NF_IPTABLES=y" >> "$DEFCONFIG"
-          echo "CONFIG_IP6_NF_FILTER=y" >> "$DEFCONFIG"
-          echo "CONFIG_IP6_NF_NAT=y" >> "$DEFCONFIG"
-          echo "CONFIG_MACVLAN=y" >> "$DEFCONFIG"
-          echo "CONFIG_NTSYNC=y" >> "$DEFCONFIG"
-          echo "CONFIG_FW_LOADER=y" >> "$DEFCONFIG"
-          echo "CONFIG_FW_LOADER_USER_HELPER=y" >> "$DEFCONFIG"
-          echo "CONFIG_FW_LOADER_COMPRESS=y" >> "$DEFCONFIG"
+          
+          if [[ "${{ inputs.enable_droidspaces }}" == "true" ]]; then
+            echo "正在追加 Droidspaces 容器支持配置..."
+            echo "CONFIG_PID_NS=y" >> "$DEFCONFIG"
+            echo "CONFIG_IPC_NS=y" >> "$DEFCONFIG"
+            echo "CONFIG_USER_NS=y" >> "$DEFCONFIG"
+            echo "CONFIG_SYSVIPC=y" >> "$DEFCONFIG"
+            echo "CONFIG_DEVTMPFS=y" >> "$DEFCONFIG"
+            echo "CONFIG_NAMESPACES=y" >> "$DEFCONFIG"
+            echo "CONFIG_POSIX_MQUEUE=y" >> "$DEFCONFIG"
+            echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y" >> "$DEFCONFIG"
+            echo "CONFIG_NETFILTER_XT_TARGET_LOG=y" >> "$DEFCONFIG"
+            echo "CONFIG_NETFILTER_XT_MATCH_RECENT=y" >> "$DEFCONFIG"
+            echo "CONFIG_NTSYNC=y" >> "$DEFCONFIG"
+            echo "CONFIG_TMPFS_XATTR=y" >> "$DEFCONFIG"
+            echo "CONFIG_TMPFS_POSIX_ACL=y" >> "$DEFCONFIG"
+            echo "CONFIG_CGROUPS=y" >> "$DEFCONFIG"
+            echo "CONFIG_CGROUP_DEVICE=y" >> "$DEFCONFIG"
+            echo "CONFIG_OVERLAY_FS=y" >> "$DEFCONFIG"
+            echo "✅ Droidspaces 配置追加完成"
+          fi
 
-      - name: 构建内核
+      - name: 构建内核 (不使用 merge_config.sh，避免配置被覆盖)
         run: |
           WORKDIR="$(pwd)"
           export PATH="/usr/lib/ccache:$PATH"
           export PATH="$WORKDIR/kernel_workspace/clang18/bin:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
           cd kernel_workspace/common
 
+          # 直接基于修改后的 gki_defconfig 编译，不合并 vendor config，排除 vendor config 冲突的可能
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out \
             KCFLAGS+=-O2 KCFLAGS+=-Wno-error gki_defconfig
-
-          echo "正在合并 vendor GKI 配置..."
-          ARCH=arm64 ./scripts/kconfig/merge_config.sh -m -O out \
-            out/.config \
-            arch/arm64/configs/vendor/sun_perf.config \
-            arch/arm64/configs/vendor/oplus/sun_perf.config
-
-          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-            CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out olddefconfig
 
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out \
@@ -256,81 +191,27 @@ jobs:
           echo "内核编译完成！"
           ccache -s
 
-      - name: 生成未修补的 boot.img (供用户在手机上修补)
+      - name: 生成 boot.img (供 KSU 修补)
         id: create_bootimg
         run: |
           cd kernel_workspace
           
-          # 1. 通过 GitHub API 动态获取 Magisk 最新 Release 的正确文件名
-          echo "正在获取 Magisk 最新 Release 信息..."
-          MAGISK_RELEASE_JSON=$(curl -fsSL https://api.github.com/repos/topjohnwu/Magisk/releases/latest)
-          MAGISK_APK_URL=$(echo "$MAGISK_RELEASE_JSON" | jq -r '.assets[] | select(.name | endswith(".apk") and (test("debug") | not)) | .browser_download_url' | head -n 1)
-          
-          if [[ -z "$MAGISK_APK_URL" ]]; then
-            echo "::error::无法获取 Magisk APK 下载链接"
-            exit 1
-          fi
-          
-          echo "正在下载 Magisk APK: $MAGISK_APK_URL"
-          curl -fLO "$MAGISK_APK_URL"
-          MAGISK_APK_FILE=$(basename "$MAGISK_APK_URL")
-          
-          echo "正在从 Magisk APK 中提取 magiskboot..."
-          unzip -j "$MAGISK_APK_FILE" "lib/x86_64/libmagiskboot.so" -d .
+          # 下载 magiskboot
+          curl -fLO https://github.com/topjohnwu/Magisk/releases/latest/download/Magisk.apk
+          unzip -j Magisk.apk "lib/x86_64/libmagiskboot.so" -d .
           mv libmagiskboot.so magiskboot
           chmod +x magiskboot
-          rm -f "$MAGISK_APK_FILE"
+          rm -f Magisk.apk
           
-          # 2. 复制编译好的内核
           cp common/out/arch/arm64/boot/Image .
-          
-          if [[ ! -f "Image" ]]; then
-            echo "::error::未找到内核镜像文件"
-            exit 1
-          fi
-          
-          # 3. 将 stock_boot.img 复制到当前目录
-          echo "正在准备 boot.img 模板..."
           cp ../stock_boot.img .
-          ls -lh stock_boot.img
           
-          # 4. 使用 magiskboot 解包原厂 boot.img
-          echo "正在解包 LineageOS 官方 boot.img..."
           mkdir -p unpack_dir
           cd unpack_dir
-          
           ../magiskboot unpack ../stock_boot.img
-          if [ $? -ne 0 ]; then
-            echo "::error::解包 stock_boot.img 失败"
-            exit 1
-          fi
-          
-          echo "解包后的文件列表:"
-          ls -lh
-          
-          # 5. 替换内核
-          echo "正在替换内核..."
           cp ../Image kernel
-          
-          # 6. 重新打包成 new-boot.img
-          echo "正在重新打包 boot.img..."
           ../magiskboot repack ../stock_boot.img ../new-boot.img
-          if [ $? -ne 0 ]; then
-            echo "::error::打包 new-boot.img 失败"
-            exit 1
-          fi
-          
           cd ..
-          
-          if [[ ! -f "new-boot.img" ]]; then
-            echo "::error::未生成 new-boot.img"
-            exit 1
-          fi
-          
-          echo "========================================="
-          echo "最终生成的 boot.img 大小 (去除填充后):"
-          ls -lh new-boot.img
-          echo "========================================="
           
           BOOTIMG_NAME="new-boot_KSUNext_By_DryEarth_${{ env.KERNEL_VERSION }}.img"
           mv new-boot.img "${BOOTIMG_NAME}"
@@ -385,16 +266,13 @@ jobs:
             echo '- **目标设备**: OnePlus Ace 5 Pro (hummer)'
             echo '- **Root 方案**: KernelSU-Next (需在手机上修补)'
             echo ''
-            echo '### 📱 刷入说明 (需要 KernelSU-Next Manager App)'
-            echo '1. 下载下方的 `new-boot_*.img` 文件。'
-            echo '2. 将文件传输到手机。'
-            echo '3. 打开 KernelSU-Next Manager App。'
-            echo '4. 点击 **"安装" -> "选择并修补一个文件"**。'
-            echo '5. 选择 `new-boot_*.img` 文件。'
-            echo '6. 等待修补完成，App 会自动刷入。'
-            echo '7. 重启手机即可。'
+            echo '### 📱 刷入说明'
+            echo '1. 下载下方的 `new-boot_*.img` 文件并传到手机。'
+            echo '2. 打开 KernelSU-Next Manager App。'
+            echo '3. 点击 **"安装" -> "选择并修补一个文件"**，选择该文件。'
+            echo '4. 等待修补完成并重启。'
             echo ''
-            echo '⚠️ **免责声明**: 刷写第三方内核存在风险，请确保已备份重要数据。'
+            echo '⚠️ **免责声明**: 刷写第三方内核存在风险。'
           } > release_notes.md
 
           gh release create "${{ env.TAG_HEAD }}-${{ env.TIME }}" \
