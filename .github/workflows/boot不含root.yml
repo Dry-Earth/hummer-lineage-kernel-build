@@ -105,13 +105,33 @@ jobs:
       - name: 下载 magiskboot 工具（仅用于解包/重打包 boot.img，与 Root 无关）
         run: |
           cd kernel_workspace
-          # magiskboot 是 boot.img 解包/重打包工具，仅用于打包内核，
-          # 不会向镜像注入任何 Root 相关代码。
-          curl -fLO https://github.com/topjohnwu/Magisk/releases/latest/download/Magisk.apk
-          unzip -j Magisk.apk "lib/x86_64/libmagiskboot.so" -d .
+
+          echo "正在获取 Magisk 最新 Release 信息..."
+          MAGISK_API=$(curl -fsSL https://api.github.com/repos/topjohnwu/Magisk/releases/latest)
+
+          MAGISK_APK_URL=$(echo "$MAGISK_API" | jq -r '.assets[] | select(.name | endswith(".apk") and (contains("debug") | not)) | .browser_download_url' | head -n 1)
+
+          if [ -z "$MAGISK_APK_URL" ] || [ "$MAGISK_APK_URL" == "null" ]; then
+            echo "::error::无法获取 Magisk APK 下载链接"
+            exit 1
+          fi
+
+          MAGISK_APK_FILE="magisk.apk"
+          echo "正在下载 Magisk APK: $MAGISK_APK_URL"
+          curl -fL -o "$MAGISK_APK_FILE" "$MAGISK_APK_URL"
+
+          echo "正在从 Magisk APK 中提取 magiskboot..."
+          if ! unzip -j "$MAGISK_APK_FILE" "lib/x86_64/libmagiskboot.so" -d . 2>/dev/null; then
+            echo "::warning::标准路径不存在，列出 APK 内 magiskboot 相关文件："
+            unzip -l "$MAGISK_APK_FILE" | grep -i magiskboot || true
+            echo "::error::无法从 Magisk APK 中提取 magiskboot"
+            exit 1
+          fi
+
           mv libmagiskboot.so magiskboot
           chmod +x magiskboot
-          rm -f Magisk.apk
+          rm -f "$MAGISK_APK_FILE"
+
           ./magiskboot --help > /dev/null 2>&1 || true
           echo "✅ magiskboot 就绪（仅打包工具，非 Root 方案）"
 
@@ -144,6 +164,7 @@ jobs:
           export PATH="$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
           cd kernel_workspace
 
+          # ===== 1. 解包原厂 boot.img =====
           echo "正在解包原厂 boot.img..."
           mkdir -p unpack_dir
           cd unpack_dir
@@ -154,9 +175,10 @@ jobs:
             echo "::error::解包失败，unpack_dir/kernel 不存在"
             exit 1
           fi
-          echo "✅ 解包成功，kernel:"
-          ls -la unpack_dir/kernel
+          echo "✅ 解包成功，unpack_dir 内容："
+          ls -la unpack_dir/
 
+          # ===== 2. 提取原厂 .config =====
           echo "正在用 extract-ikconfig 提取原厂配置..."
           cd common
           mkdir -p out
@@ -170,6 +192,15 @@ jobs:
             grep '^CONFIG_LOCALVERSION=' common/out/.config || echo "  (未设置)"
             echo "原厂 CONFIG_IKCONFIG:"
             grep '^CONFIG_IKCONFIG' common/out/.config || echo "  (未设置)"
+
+            # 保存提取的原厂配置，用于后续对比
+            cp common/out/.config common/stock_extracted.config
+
+            # 快照原厂 =y 和 =m 的符号列表
+            grep -E '^CONFIG_[A-Z0-9_]+=y' common/stock_extracted.config | cut -d= -f1 | sort > common/orig_y_list.txt
+            grep -E '^CONFIG_[A-Z0-9_]+=m' common/stock_extracted.config | cut -d= -f1 | sort > common/orig_m_list.txt
+            echo "原厂 =y 项数: $(wc -l < common/orig_y_list.txt)"
+            echo "原厂 =m 项数: $(wc -l < common/orig_m_list.txt)"
           else
             echo "::warning::未能从原厂 boot.img 提取配置（可能原厂未开启 CONFIG_IKCONFIG 或 kernel 格式不支持）。"
             echo "正在回退到 gki_defconfig + vendor merge 方案..."
@@ -184,6 +215,7 @@ jobs:
             cd ..
           fi
 
+          # ===== 3. 微创注入 =====
           echo "正在执行微创手术：添加 Droidspaces 缺失配置..."
           ./common/scripts/config --file ./common/out/.config \
             --enable NAMESPACES \
@@ -196,12 +228,75 @@ jobs:
             --enable IKCONFIG \
             --enable IKCONFIG_PROC
 
+          # ===== 4. olddefconfig =====
           cd common
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out olddefconfig
           cd ..
 
+          # ===== 5. 配置变化统计（只读，不阻断） =====
+          if [ -f common/stock_extracted.config ] && [ -f common/orig_y_list.txt ]; then
+            echo "========================================="
+            echo "配置变化统计（原厂 vs 新配置）"
+            echo "========================================="
+
+            grep -E '^CONFIG_[A-Z0-9_]+=y' common/out/.config | cut -d= -f1 | sort > common/new_y_list.txt
+            grep -E '^CONFIG_[A-Z0-9_]+=[my]' common/out/.config | cut -d= -f1 | sort > common/new_my_list.txt
+
+            ORIG_Y=$(wc -l < common/orig_y_list.txt)
+            NEW_Y=$(wc -l < common/new_y_list.txt)
+
+            comm -23 common/orig_y_list.txt common/new_y_list.txt > common/lost_y.txt
+            LOST_Y=$(wc -l < common/lost_y.txt)
+
+            comm -13 common/orig_y_list.txt common/new_y_list.txt > common/added_y.txt
+            ADDED_Y=$(wc -l < common/added_y.txt)
+
+            echo "原厂 =y 项数:       $ORIG_Y"
+            echo "新配置 =y 项数:     $NEW_Y"
+            echo "丢失（原厂有→无）: $LOST_Y"
+            echo "新增（原厂无→有）: $ADDED_Y"
+
+            if [ "$LOST_Y" -gt 0 ]; then
+              echo ""
+              echo "丢失项列表（前 30 个）："
+              head -30 common/lost_y.txt
+
+              HW_LOST=$(grep -cE 'CONFIG_(DRM|VIDEO|INPUT|SOUND|NET|USB|MMC|SCSI|POWER|REGULATOR|CLK|I2C|SPI|GPIO|PINCONF|THERMAL|HWMON|LEDS|BACKLIGHT|BATTERY|CHARGER|PHY|PCIE|UFS|NAND|MTD)_' common/lost_y.txt || echo "0")
+              if [ "$HW_LOST" -gt 0 ]; then
+                echo ""
+                echo "其中硬件相关丢失项："
+                grep -E 'CONFIG_(DRM|VIDEO|INPUT|SOUND|NET|USB|MMC|SCSI|POWER|REGULATOR|CLK|I2C|SPI|GPIO|PINCONF|THERMAL|HWMON|LEDS|BACKLIGHT|BATTERY|CHARGER|PHY|PCIE|UFS|NAND|MTD)_' common/lost_y.txt | head -30
+              fi
+            fi
+
+            if [ "$LOST_Y" -gt 50 ]; then
+              echo "::warning::丢失 $LOST_Y 个原厂 =y 项，源码版本可能偏差较大，刷入后请重点测硬件。"
+            elif [ "$LOST_Y" -gt 10 ]; then
+              echo "::notice::丢失 $LOST_Y 个原厂 =y 项，属正常版本差异范围。"
+            else
+              echo "✅ 丢失极少 ($LOST_Y)，源码版本高度匹配。"
+            fi
+
+            if [ -f common/orig_m_list.txt ]; then
+              comm -23 common/orig_m_list.txt common/new_my_list.txt > common/lost_m.txt
+              LOST_M=$(wc -l < common/lost_m.txt)
+              echo ""
+              echo "丢失的原厂 =m 项数: $LOST_M"
+              if [ "$LOST_M" -gt 0 ]; then
+                echo "丢失模块项（前 20 个）："
+                head -20 common/lost_m.txt
+                echo "::warning::丢失 $LOST_M 个原厂模块项，对应 .ko 可能无法加载，刷入后留意硬件。"
+              fi
+            fi
+          else
+            echo "::notice::未提取到原厂配置，跳过配置变化统计。"
+          fi
+
+          # ===== 6. 断言检查 =====
+          echo "========================================="
           echo "正在执行断言检查 (验证 olddefconfig 后的最终配置)..."
+          echo "========================================="
           ASSERT_PASS=true
           for CONFIG in CONFIG_NAMESPACES CONFIG_MULTIUSER CONFIG_PID_NS CONFIG_IPC_NS CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE CONFIG_DEVTMPFS CONFIG_IKCONFIG CONFIG_IKCONFIG_PROC; do
             if grep -q "^${CONFIG}=y" common/out/.config; then
@@ -234,17 +329,96 @@ jobs:
           ccache -s
           ls -la out/arch/arm64/boot/Image
 
-      - name: 生成 boot.img
+      - name: 生成 boot.img 并进行无损校验
         id: create_bootimg
         run: |
           cd kernel_workspace
 
+          # ===== 1. 替换 kernel =====
           cp common/out/arch/arm64/boot/Image unpack_dir/kernel
+          echo "✅ 已替换新内核 (Image)"
 
+          # ===== 2. 重新打包 =====
           cd unpack_dir
           ../magiskboot repack ../stock_boot.img ../new-boot.img
+          if [ $? -ne 0 ]; then
+            echo "::error::magiskboot repack 失败！"
+            exit 1
+          fi
           cd ..
 
+          # ===== 3. 重打包完整性校验 =====
+          echo "========================================="
+          echo "正在校验重打包后的 boot.img..."
+          echo "========================================="
+          rm -rf repack_check
+          mkdir -p repack_check
+          cd repack_check
+          ../magiskboot unpack ../new-boot.img
+
+          # 3.1 Ramdisk 校验
+          if [ -f ../unpack_dir/ramdisk.cpio ]; then
+            if cmp -s ../unpack_dir/ramdisk.cpio ramdisk.cpio; then
+              echo "  [✓] Ramdisk 内容一致"
+            else
+              echo "::warning::Ramdisk 内容不同（可能是 magiskboot 重新压缩，不一定有问题）"
+            fi
+          else
+            echo "  [ℹ] 原厂 boot.img 无 ramdisk（ramdisk 可能在 init_boot 中）"
+          fi
+
+          # 3.2 DTB 校验（动态检测 dtb / kernel_dtb）
+          DTB_CHECKED=0
+          for DTB_FILE in dtb kernel_dtb; do
+            if [ -f "../unpack_dir/$DTB_FILE" ]; then
+              DTB_CHECKED=1
+              if [ -f "$DTB_FILE" ]; then
+                HASH_ORIG=$(md5sum "../unpack_dir/$DTB_FILE" | awk '{print $1}')
+                HASH_NEW=$(md5sum "$DTB_FILE" | awk '{print $1}')
+                if [ "$HASH_ORIG" == "$HASH_NEW" ]; then
+                  echo "  [✓] $DTB_FILE 校验通过 (MD5: $HASH_ORIG)"
+                else
+                  echo "::error::[✗] $DTB_FILE 校验失败！数据已损坏或丢失！"
+                  exit 1
+                fi
+              else
+                echo "::error::[✗] 原厂有 $DTB_FILE，但 repack 后丢失！"
+                exit 1
+              fi
+            fi
+          done
+          if [ "$DTB_CHECKED" -eq 0 ]; then
+            echo "  [ℹ] 原厂 boot.img 无独立 dtb（dtb 可能在 vendor_boot.img 中，本次修改不涉及）"
+          fi
+
+          # 3.3 Kernel 替换提示
+          if [ -f kernel ]; then
+            HASH_IMG=$(md5sum ../common/out/arch/arm64/boot/Image | awk '{print $1}')
+            HASH_KERNEL=$(md5sum kernel | awk '{print $1}')
+            if [ "$HASH_IMG" == "$HASH_KERNEL" ]; then
+              echo "  [✓] Kernel 替换校验通过（未压缩，md5 一致）"
+            else
+              echo "  [ℹ] Kernel md5 不同（原厂可能是压缩格式，magiskboot 自动压缩了新 Image，属正常）"
+              echo "      新 Image:   $HASH_IMG"
+              echo "      包内 kernel: $HASH_KERNEL"
+            fi
+          fi
+
+          # 3.4 文件大小检查
+          ORIG_SIZE=$(stat -c%s ../stock_boot.img)
+          NEW_SIZE=$(stat -c%s ../new-boot.img)
+          echo "  [ℹ] 原厂 boot.img: $ORIG_SIZE bytes"
+          echo "  [ℹ] 新 boot.img:   $NEW_SIZE bytes"
+
+          if [ "$NEW_SIZE" -lt 10000000 ]; then
+            echo "::error::[✗] 新 boot.img 小于 10MB，打包异常！"
+            exit 1
+          fi
+
+          echo "✅ 无损校验完成！"
+          cd ..
+
+          # ===== 4. 输出最终文件 =====
           BOOTIMG_NAME="droidspaces-extract-boot.img"
           mv new-boot.img "${BOOTIMG_NAME}"
           echo "bootimg_name=${BOOTIMG_NAME}" >> $GITHUB_OUTPUT
