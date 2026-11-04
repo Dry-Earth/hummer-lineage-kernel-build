@@ -1,12 +1,11 @@
-name: LineageOS 23.2 Kernel for hummer (6.6.144) [cctv18 Proven Method]
+name: LineageOS 23.2 Kernel for hummer (6.6.144) [LineageOS Ultimate Native]
 
 env:
   TZ: Asia/Shanghai
   ANDROID_VERSION: 'android16'
   KERNEL_VERSION: '6.6'
   SUB_VERSION: '144'
-  KERNEL_NAME: 'lineageos-23.2-hummer'
-  CCACHE_KEY: ccache-lineageos23.2-6.6.144-proven
+  CCACHE_KEY: ccache-lineageos23.2-6.6.144-ultimate
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   CCACHE_MAXSIZE: 5G
   OFFICIAL_BOOT_URL: "https://mirrorbits.lineageos.org/full/hummer/20261009/boot.img"
@@ -55,7 +54,7 @@ jobs:
         run: |
           curl -f -L -C - --retry 3 --retry-delay 5 -o stock_boot.img "${{ env.OFFICIAL_BOOT_URL }}"
 
-      - name: 安装环境依赖 & 初始化源码与工具链 (完全模仿 cctv18)
+      - name: 安装环境依赖 & 初始化源码与工具链 (使用官方 LLVM 19)
         run: |
           rm -rf kernel_workspace
           mkdir kernel_workspace
@@ -64,23 +63,51 @@ jobs:
           echo "正在克隆 LineageOS 官方 SM8750 内核源码..."
           git clone --depth=1 --branch lineage-23.2 https://github.com/LineageOS/android_kernel_oneplus_sm8750.git common
 
-          echo "正在克隆 llvm-clang18 工具链 (稳定版 r510928)..."
+          echo "[关键] 正在下载 LineageOS 官方 LLVM/Clang (r547379 - Android 16 推荐)..."
           mkdir -p clang18
-          aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang18-r510928/clang-r510928.zip -o clang.zip
-          unzip -q clang.zip -d clang18
-          rm -rf clang.zip
+          
+          # 使用稳健的 curl 下载 + 校验方案
+          MAX_RETRIES=3
+          RETRY_COUNT=0
+          DOWNLOAD_SUCCESS=false
+          
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$DOWNLOAD_SUCCESS" = false ]; do
+            echo "尝试下载 Clang 工具链 (第 $((RETRY_COUNT + 1)) 次)..."
+            curl -f -L -C - --retry 3 --retry-delay 5 --retry-connrefused \
+              -o clang-r547379.tar.gz \
+              https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android16-qpr2-release/clang-r547379.tar.gz
+            
+            echo "正在验证文件完整性..."
+            if tar -tzf clang-r547379.tar.gz > /dev/null 2>&1; then
+              echo "✅ 文件完整性验证通过"
+              DOWNLOAD_SUCCESS=true
+            else
+              echo "❌ 文件损坏，删除后重试..."
+              rm -f clang-r547379.tar.gz
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+              sleep 5
+            fi
+          done
+          
+          if [ "$DOWNLOAD_SUCCESS" = false ]; then
+            echo "::error::Clang 工具链下载失败"
+            exit 1
+          fi
+          
+          tar -xzf clang-r547379.tar.gz -C clang18
+          rm -f clang-r547379.tar.gz
 
           echo "正在克隆构建工具..."
           aria2c -s16 -x16 -k1M https://github.com/cctv18/oneplus_sm8650_toolchain/releases/download/LLVM-Clang18-r510928/build-tools.zip -o build-tools.zip
           unzip -q build-tools.zip
           rm -rf build-tools.zip
 
-          echo "去除 ABI 保护 & 去除 dirty 后缀 (模仿 cctv18 成功配置)..."
-          rm -f common/android/abi_gki_protected_exports_* || true
+          echo "[关键] 仅去除 dirty 后缀 & 保留 ABI 保护 (LineageOS 标准规范)..."
           for f in common/scripts/setlocalversion; do
             sed -i 's/ -dirty//g' "$f"
             sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' "$f"
           done
+          echo "CONFIG_LOCALVERSION_AUTO=n" >> common/arch/arm64/configs/gki_defconfig
 
       - name: 计算 ccache 真实 Key
         run: |
@@ -134,7 +161,7 @@ jobs:
           echo "KSUVER=${KSUVER}" >> $GITHUB_ENV
           echo "ksuver=${KSUVER}" >> $GITHUB_OUTPUT
 
-      - name: 应用 Droidspaces kABI 补丁 (核心防崩溃补丁)
+      - name: 应用 Droidspaces 官方 kABI 补丁
         if: inputs.enable_droidspaces == true
         run: |
           cd kernel_workspace/common
@@ -143,35 +170,7 @@ jobs:
           patch -p1 -F 3 < fix_sysvipc_kabi_6_7_8.patch || true
           echo "✅ kABI 补丁应用成功"
 
-      - name: 直接修改 gki_defconfig (模仿 cctv18 的可靠方式，不使用 merge_config)
-        run: |
-          cd kernel_workspace/common
-          DEFCONFIG="arch/arm64/configs/gki_defconfig"
-          
-          echo "CONFIG_KSU=y" >> "$DEFCONFIG"
-          
-          if [[ "${{ inputs.enable_droidspaces }}" == "true" ]]; then
-            echo "正在追加 Droidspaces 容器支持配置..."
-            echo "CONFIG_PID_NS=y" >> "$DEFCONFIG"
-            echo "CONFIG_IPC_NS=y" >> "$DEFCONFIG"
-            echo "CONFIG_USER_NS=y" >> "$DEFCONFIG"
-            echo "CONFIG_SYSVIPC=y" >> "$DEFCONFIG"
-            echo "CONFIG_DEVTMPFS=y" >> "$DEFCONFIG"
-            echo "CONFIG_NAMESPACES=y" >> "$DEFCONFIG"
-            echo "CONFIG_POSIX_MQUEUE=y" >> "$DEFCONFIG"
-            echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y" >> "$DEFCONFIG"
-            echo "CONFIG_NETFILTER_XT_TARGET_LOG=y" >> "$DEFCONFIG"
-            echo "CONFIG_NETFILTER_XT_MATCH_RECENT=y" >> "$DEFCONFIG"
-            echo "CONFIG_NTSYNC=y" >> "$DEFCONFIG"
-            echo "CONFIG_TMPFS_XATTR=y" >> "$DEFCONFIG"
-            echo "CONFIG_TMPFS_POSIX_ACL=y" >> "$DEFCONFIG"
-            echo "CONFIG_CGROUPS=y" >> "$DEFCONFIG"
-            echo "CONFIG_CGROUP_DEVICE=y" >> "$DEFCONFIG"
-            echo "CONFIG_OVERLAY_FS=y" >> "$DEFCONFIG"
-            echo "✅ Droidspaces 配置追加完成"
-          fi
-
-      - name: 构建内核 (不使用 merge_config.sh，避免配置被覆盖)
+      - name: 构建内核 (LineageOS 标准流程：Defconfig -> Merge Vendor -> 强制注入 DS 配置 -> 编译)
         run: |
           WORKDIR="$(pwd)"
           export PATH="/usr/lib/ccache:$PATH"
@@ -179,10 +178,42 @@ jobs:
           export PATH="$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
           cd kernel_workspace/common
 
-          # 直接基于修改后的 gki_defconfig 编译，不合并 vendor config，排除 vendor config 冲突的可能
+          # 1. 注入 KSU 配置并生成基础 GKI 配置
+          echo "CONFIG_KSU=y" >> arch/arm64/configs/gki_defconfig
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out \
             KCFLAGS+=-O2 KCFLAGS+=-Wno-error gki_defconfig
+
+          # 2. [关键] 合并 Vendor 配置，确保硬件驱动编译
+          echo "正在合并 vendor GKI 配置..."
+          ARCH=arm64 ./scripts/kconfig/merge_config.sh -m -O out \
+            out/.config \
+            arch/arm64/configs/vendor/sun_perf.config \
+            arch/arm64/configs/vendor/oplus/sun_perf.config
+
+          # 3. [关键] 在 merge 之后，强制注入 Droidspaces 配置 (已移除 IPv6 NAT 以规避 VINTF 风险)
+          if [[ "${{ inputs.enable_droidspaces }}" == "true" ]]; then
+            echo "正在强制注入 Droidspaces 配置到 out/.config..."
+            ./scripts/config --file out/.config \
+              --enable PID_NS \
+              --enable IPC_NS \
+              --enable USER_NS \
+              --enable SYSVIPC \
+              --enable DEVTMPFS \
+              --enable NAMESPACES \
+              --enable POSIX_MQUEUE \
+              --enable NETFILTER_XT_MATCH_ADDRTYPE \
+              --enable NETFILTER_XT_TARGET_LOG \
+              --enable NETFILTER_XT_MATCH_RECENT \
+              --enable NTSYNC \
+              --enable TMPFS_XATTR \
+              --enable TMPFS_POSIX_ACL
+              # 已移除 CONFIG_IP6_NF_NAT 和 CONFIG_IP6_NF_TARGET_MASQUERADE
+          fi
+
+          # 4. 解决依赖并编译
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out olddefconfig
 
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out \
@@ -196,7 +227,6 @@ jobs:
         run: |
           cd kernel_workspace
           
-          # 下载 magiskboot
           curl -fLO https://github.com/topjohnwu/Magisk/releases/latest/download/Magisk.apk
           unzip -j Magisk.apk "lib/x86_64/libmagiskboot.so" -d .
           mv libmagiskboot.so magiskboot
