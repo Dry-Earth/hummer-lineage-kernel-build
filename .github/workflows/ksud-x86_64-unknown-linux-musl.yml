@@ -289,7 +289,7 @@ jobs:
             exit 1
           fi
           
-          # 3. [关键修复] 将 stock_boot.img 复制到当前目录，解决路径问题
+          # 3. 将 stock_boot.img 复制到当前目录
           echo "正在准备 boot.img 模板..."
           cp ../stock_boot.img .
           ls -lh stock_boot.img
@@ -349,7 +349,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.create_bootimg.outputs.bootimg_name }}
-          path: ${{ github.workspace }}/${{ steps.create_bootimg.outputs.bootimg_name }}
+          path: kernel_workspace/${{ steps.create_bootimg.outputs.bootimg_name }}
           if-no-files-found: error
 
   release:
