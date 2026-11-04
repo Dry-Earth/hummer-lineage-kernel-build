@@ -289,22 +289,24 @@ jobs:
             exit 1
           fi
           
-          # 3. [诊断] 先查看官方 boot.img 的详细信息
-          echo "========================================="
-          echo "官方 boot.img 详细信息:"
-          ls -lh ../stock_boot.img
-          echo "========================================="
+          # 3. [关键修复] 将 stock_boot.img 复制到当前目录，解决路径问题
+          echo "正在准备 boot.img 模板..."
+          cp ../stock_boot.img .
+          ls -lh stock_boot.img
           
           # 4. 使用 magiskboot 解包原厂 boot.img
           echo "正在解包 LineageOS 官方 boot.img..."
           mkdir -p unpack_dir
           cd unpack_dir
-          ../magiskboot unpack ../stock_boot.img
           
-          echo "========================================="
-          echo "解包后生成的文件:"
+          ../magiskboot unpack ../stock_boot.img
+          if [ $? -ne 0 ]; then
+            echo "::error::解包 stock_boot.img 失败"
+            exit 1
+          fi
+          
+          echo "解包后的文件列表:"
           ls -lh
-          echo "========================================="
           
           # 5. 替换内核
           echo "正在替换内核..."
@@ -326,7 +328,7 @@ jobs:
           fi
           
           echo "========================================="
-          echo "最终生成的 boot.img 大小:"
+          echo "最终生成的 boot.img 大小 (去除填充后):"
           ls -lh new-boot.img
           echo "========================================="
           
