@@ -54,13 +54,12 @@ jobs:
       - name: 下载 LineageOS 官方 boot.img 作为模板
         run: |
           echo "正在下载 LineageOS 官方 boot.img..."
-          # [优化] 加上 -f 防错误页面，-C - 支持断点续传
           curl -f -L -C - --retry 3 --retry-delay 5 -o stock_boot.img "${{ env.OFFICIAL_BOOT_URL }}"
           if [ ! -f "stock_boot.img" ] || [ ! -s "stock_boot.img" ]; then
             echo "::error::下载 stock_boot.img 失败或文件为空"
             exit 1
           fi
-          echo "✅ 官方 boot.img 下载成功"
+          echo "✅ 官方 boot.img 下载成功，大小：$(du -h stock_boot.img | cut -f1)"
 
       - name: 安装环境依赖
         run: |
@@ -85,22 +84,16 @@ jobs:
           echo "正在下载 LineageOS 官方 LLVM/Clang (r547379)..."
           mkdir -p clang18
           
-          # [核心优化] 采纳建议：加入 -f 拦截 HTTP 错误，加入 -C - 支持断点续传
           MAX_RETRIES=3
           RETRY_COUNT=0
           DOWNLOAD_SUCCESS=false
           
           while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$DOWNLOAD_SUCCESS" = false ]; do
             echo "尝试下载 Clang 工具链 (第 $((RETRY_COUNT + 1)) 次)..."
-            
-            # -f: 遇到 404/500 直接失败，不下载错误页面
-            # -C -: 断点续传，网络中断后接着下
-            # --retry 3: curl 自带重试机制
             curl -f -L -C - --retry 3 --retry-delay 5 --retry-connrefused \
               -o clang-r547379.tar.gz \
               https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android16-qpr2-release/clang-r547379.tar.gz
             
-            # 验证文件完整性
             echo "正在验证文件完整性..."
             if tar -tzf clang-r547379.tar.gz > /dev/null 2>&1; then
               echo "✅ 文件完整性验证通过"
@@ -279,7 +272,6 @@ jobs:
           fi
           
           echo "正在下载 Magisk APK: $MAGISK_APK_URL"
-          # [优化] 加上 -f 防止下载错误页面
           curl -fLO "$MAGISK_APK_URL"
           MAGISK_APK_FILE=$(basename "$MAGISK_APK_URL")
           
@@ -297,33 +289,49 @@ jobs:
             exit 1
           fi
           
-          # 3. 使用 magiskboot 解包原厂 boot.img
+          # 3. [诊断] 先查看官方 boot.img 的详细信息
+          echo "========================================="
+          echo "官方 boot.img 详细信息:"
+          ls -lh ../stock_boot.img
+          echo "========================================="
+          
+          # 4. 使用 magiskboot 解包原厂 boot.img
           echo "正在解包 LineageOS 官方 boot.img..."
-          ./magiskboot unpack ../stock_boot.img
-          if [ $? -ne 0 ]; then
-            echo "::error::解包 stock_boot.img 失败"
-            exit 1
-          fi
+          mkdir -p unpack_dir
+          cd unpack_dir
+          ../magiskboot unpack ../stock_boot.img
           
-          # 4. 替换内核
+          echo "========================================="
+          echo "解包后生成的文件:"
+          ls -lh
+          echo "========================================="
+          
+          # 5. 替换内核
           echo "正在替换内核..."
-          cp Image kernel
+          cp ../Image kernel
           
-          # 5. 重新打包成 new-boot.img (不修补 ramdisk)
+          # 6. 重新打包成 new-boot.img
           echo "正在重新打包 boot.img..."
-          ./magiskboot repack ../stock_boot.img ../new-boot.img
+          ../magiskboot repack ../stock_boot.img ../new-boot.img
           if [ $? -ne 0 ]; then
             echo "::error::打包 new-boot.img 失败"
             exit 1
           fi
           
-          if [[ ! -f "../new-boot.img" ]]; then
+          cd ..
+          
+          if [[ ! -f "new-boot.img" ]]; then
             echo "::error::未生成 new-boot.img"
             exit 1
           fi
           
+          echo "========================================="
+          echo "最终生成的 boot.img 大小:"
+          ls -lh new-boot.img
+          echo "========================================="
+          
           BOOTIMG_NAME="new-boot_KSUNext_By_DryEarth_${{ env.KERNEL_VERSION }}.img"
-          mv ../new-boot.img "../${BOOTIMG_NAME}"
+          mv new-boot.img "${BOOTIMG_NAME}"
           echo "bootimg_name=${BOOTIMG_NAME}" >> $GITHUB_OUTPUT
           echo "✅ boot.img 生成完成，请在手机上使用 KernelSU-Next Manager 修补！"
 
