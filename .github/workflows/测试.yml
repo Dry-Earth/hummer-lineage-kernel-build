@@ -1,0 +1,131 @@
+name: LineageOS 23.2 Kernel for hummer (6.6.144) [Minimal Test]
+
+env:
+  TZ: Asia/Shanghai
+  ANDROID_VERSION: 'android16'
+  KERNEL_VERSION: '6.6'
+  SUB_VERSION: '144'
+  KERNEL_NAME: 'lineageos-23.2-hummer'
+  CCACHE_KEY: ccache-lineageos23.2-6.6.144-minimal
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_MAXSIZE: 5G
+  OFFICIAL_BOOT_URL: "https://mirrorbits.lineageos.org/full/hummer/20261009/boot.img"
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    outputs:
+      bootimg_name: ${{ steps.create_bootimg.outputs.bootimg_name }}
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 下载 LineageOS 官方 boot.img
+        run: |
+          curl -f -L -C - --retry 3 --retry-delay 5 -o stock_boot.img "${{ env.OFFICIAL_BOOT_URL }}"
+
+      - name: 安装环境依赖
+        run: |
+          sudo apt update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libncurses-dev libncurses5-dev dwarves \
+            libssl-dev libelf-dev aria2 unzip zip git wget ccache patch \
+            gcc-aarch64-linux-gnu jq
+
+      - name: 初始化内核源码与工具链
+        run: |
+          rm -rf kernel_workspace
+          mkdir kernel_workspace
+          cd kernel_workspace
+
+          git clone --depth=1 --branch lineage-23.2 https://github.com/LineageOS/android_kernel_oneplus_sm8750.git common
+          git clone --depth=1 --branch lineage-23.2 https://github.com/LineageOS/android_kernel_oneplus_sm8750-modules.git sm8750-modules
+
+          mkdir -p clang18
+          MAX_RETRIES=3
+          RETRY_COUNT=0
+          DOWNLOAD_SUCCESS=false
+          
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$DOWNLOAD_SUCCESS" = false ]; do
+            curl -f -L -C - --retry 3 --retry-delay 5 --retry-connrefused \
+              -o clang-r547379.tar.gz \
+              https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android16-qpr2-release/clang-r547379.tar.gz
+            
+            if tar -tzf clang-r547379.tar.gz > /dev/null 2>&1; then
+              DOWNLOAD_SUCCESS=true
+            else
+              rm -f clang-r547379.tar.gz
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+              sleep 5
+            fi
+          done
+          
+          tar -xzf clang-r547379.tar.gz -C clang18
+          rm -f clang-r547379.tar.gz
+
+      - name: 构建极简内核 (无 KSU, 无 Droidspaces, 无 kABI 补丁)
+        run: |
+          WORKDIR="$(pwd)"
+          export PATH="/usr/lib/ccache:$PATH"
+          export PATH="$WORKDIR/kernel_workspace/clang18/bin:$PATH"
+          cd kernel_workspace/common
+
+          # 仅使用基础 GKI 配置 + 原厂 Vendor 配置
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out \
+            KCFLAGS+=-O2 KCFLAGS+=-Wno-error gki_defconfig
+
+          ARCH=arm64 ./scripts/kconfig/merge_config.sh -m -O out \
+            out/.config \
+            arch/arm64/configs/vendor/sun_perf.config \
+            arch/arm64/configs/vendor/oplus/sun_perf.config
+
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out olddefconfig
+
+          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out \
+            KCFLAGS+=-O2 KCFLAGS+=-Wno-error Image
+
+      - name: 打包 boot.img
+        id: create_bootimg
+        run: |
+          cd kernel_workspace
+          
+          # 下载 magiskboot
+          curl -fLO https://github.com/topjohnwu/Magisk/releases/latest/download/Magisk.apk
+          unzip -j Magisk.apk "lib/x86_64/libmagiskboot.so" -d .
+          mv libmagiskboot.so magiskboot
+          chmod +x magiskboot
+          rm -f Magisk.apk
+          
+          cp common/out/arch/arm64/boot/Image .
+          cp ../stock_boot.img .
+          
+          mkdir -p unpack_dir
+          cd unpack_dir
+          ../magiskboot unpack ../stock_boot.img
+          cp ../Image kernel
+          ../magiskboot repack ../stock_boot.img ../new-boot.img
+          cd ..
+          
+          BOOTIMG_NAME="minimal-test-boot.img"
+          mv new-boot.img "${BOOTIMG_NAME}"
+          echo "bootimg_name=${BOOTIMG_NAME}" >> $GITHUB_OUTPUT
+
+      - name: 上传工件
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.create_bootimg.outputs.bootimg_name }}
+          path: kernel_workspace/${{ steps.create_bootimg.outputs.bootimg_name }}
