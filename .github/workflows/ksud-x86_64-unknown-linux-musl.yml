@@ -56,7 +56,6 @@ jobs:
 
       - name: 安装环境依赖 & 初始化源码与工具链 (使用官方 LLVM 19)
         run: |
-          # [修复] 补全所有必要的环境依赖安装
           sudo apt update
           sudo apt-get install -y --no-install-recommends \
             bc bison flex libncurses-dev libncurses5-dev dwarves \
@@ -69,6 +68,12 @@ jobs:
 
           echo "正在克隆 LineageOS 官方 SM8750 内核源码..."
           git clone --depth=1 --branch lineage-23.2 https://github.com/LineageOS/android_kernel_oneplus_sm8750.git common
+          
+          # [关键修复] 初始化 Git 子模块，解决 kernelFwUpdate/Kconfig 缺失问题
+          echo "正在初始化子模块 (修复 kernelFwUpdate 缺失)..."
+          cd common
+          git submodule update --init --recursive --depth=1
+          cd ..
 
           echo "[关键] 正在下载 LineageOS 官方 LLVM/Clang (r547379 - Android 16 推荐)..."
           mkdir -p clang18
