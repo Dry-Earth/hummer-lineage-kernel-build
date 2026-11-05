@@ -1,13 +1,16 @@
-name: LineageOS 23.2 Kernel for hummer (6.6.144) [Extract Config Minimal Patch]
+name: LineageOS 24 Kernel for hummer (6.6.x) [Extract Config Minimal Patch]
 
 env:
   TZ: Asia/Shanghai
+  ANDROID_VERSION: 'android17'
   KERNEL_VERSION: '6.6'
-  SUB_VERSION: '144'
-  CCACHE_KEY: ccache-lineageos23.2-6.6.144-extract
+  # SUB_VERSION 留空或根据实际 LOS24 版本调整，extract-ikconfig 会自动处理核心配置
+  SUB_VERSION: 'latest' 
+  CCACHE_KEY: ccache-lineageos24-6.6-extract
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   CCACHE_MAXSIZE: 5G
-  OFFICIAL_BOOT_URL: "https://mirrorbits.lineageos.org/full/hummer/20261009/boot.img"
+  # 【关键更新】LineageOS 24 最新官方 boot.img 链接
+  OFFICIAL_BOOT_URL: "https://mirrorbits.lineageos.org/full/hummer/20261030/boot.img"
 
 on:
   workflow_dispatch:
@@ -29,7 +32,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 下载 LineageOS 官方 boot.img
+      - name: 下载 LineageOS 24 官方 boot.img
         run: |
           curl -f -L -C - --retry 3 --retry-delay 5 -o stock_boot.img "${{ env.OFFICIAL_BOOT_URL }}"
           ls -la stock_boot.img
@@ -48,44 +51,36 @@ jobs:
 
           cp ../stock_boot.img .
 
-          echo "正在克隆 LineageOS 官方 SM8750 内核源码..."
-          git clone --depth=1 --branch lineage-23.2 https://github.com/LineageOS/android_kernel_oneplus_sm8750.git common
+          # 【关键更新】克隆 LineageOS 24 (lineage-24.0) 源码
+          echo "正在克隆 LineageOS 24 官方 SM8750 内核源码..."
+          git clone --depth=1 --branch lineage-24.0 https://github.com/LineageOS/android_kernel_oneplus_sm8750.git common
 
           echo "正在初始化子模块..."
           cd common
           git submodule update --init --recursive --depth=1
           
-          # 【全自动排雷 2.0】全局扫描并清理缺失的闭源驱动引用
+          # 【核心防御】全自动清理缺失的闭源驱动 Kconfig/Makefile 引用 (排雷)
           echo "========================================="
           echo "正在全自动清理缺失的闭源驱动引用..."
           echo "========================================="
-          
-          # 1. 清理所有 Kconfig 中的无效 source
-          find . -name "Kconfig" | while read -r kconfig_file; do
-            grep -oP '(?<=source ").*(?=")' "$kconfig_file" 2>/dev/null | while read -r path; do
-              # 忽略包含变量的路径 (如 source "arch/$ARCH/Kconfig")
-              if [[ "$path" == *"$"* ]]; then continue; fi
-              
-              if [ ! -f "$path" ] && [ ! -d "$path" ]; then
-                echo "  -> [$kconfig_file] 发现缺失路径: $path，正在自动移除..."
-                # 转义特殊字符以供 sed 使用
+          if [ -f drivers/base/Kconfig ]; then
+            grep -oP '(?<=source ").*(?=")' drivers/base/Kconfig | while read -r path; do
+              if [ ! -f "$path" ] && [[ "$path" == drivers/base/* ]]; then
+                echo "  -> 发现缺失路径: $path，正在自动移除引用..."
                 escaped_path=$(echo "$path" | sed 's/[]\/$*.^[]/\\&/g')
-                sed -i "/source \"$escaped_path\"/d" "$kconfig_file"
+                sed -i "/source \"$escaped_path\"/d" drivers/base/Kconfig
               fi
             done
-          done
+          fi
 
-          # 2. 清理所有 Makefile 中的无效 obj-y/obj-m
-          find . -name "Makefile" | while read -r makefile; do
-            grep -oP '(?<=obj-[ym] \+= )[\w\-]+(?=/)' "$makefile" 2>/dev/null | sort -u | while read -r dir; do
-              makefile_dir=$(dirname "$makefile")
-              if [ ! -d "$makefile_dir/$dir" ]; then
-                echo "  -> [$makefile] 发现缺失目录: $dir，正在从 Makefile 移除..."
-                sed -i "/obj-[ym] += $dir\//d" "$makefile"
+          if [ -f drivers/base/Makefile ]; then
+            grep -oP '(?<=obj-[ym] \+= )[\w\-]+(?=/)' drivers/base/Makefile | sort -u | while read -r dir; do
+              if [ ! -d "drivers/base/$dir" ]; then
+                echo "  -> 发现缺失目录: $dir，正在从 Makefile 移除..."
+                sed -i "/obj-[ym] += $dir\//d" drivers/base/Makefile
               fi
             done
-          done
-          echo "✅ 全自动排雷完成！"
+          fi
           cd ..
 
           echo "正在下载 LineageOS 官方 LLVM/Clang (r547379)..."
@@ -137,10 +132,8 @@ jobs:
       - name: 下载 magiskboot 工具（仅用于解包/重打包 boot.img，与 Root 无关）
         run: |
           cd kernel_workspace
-
           echo "正在获取 Magisk 最新 Release 信息..."
           MAGISK_API=$(curl -fsSL https://api.github.com/repos/topjohnwu/Magisk/releases/latest)
-
           MAGISK_APK_URL=$(echo "$MAGISK_API" | jq -r '.assets[] | select(.name | endswith(".apk") and (contains("debug") | not)) | .browser_download_url' | head -n 1)
 
           if [ -z "$MAGISK_APK_URL" ] || [ "$MAGISK_APK_URL" == "null" ]; then
@@ -163,9 +156,8 @@ jobs:
           mv libmagiskboot.so magiskboot
           chmod +x magiskboot
           rm -f "$MAGISK_APK_FILE"
-
           ./magiskboot --help > /dev/null 2>&1 || true
-          echo "✅ magiskboot 就绪（仅打包工具，非 Root 方案）"
+          echo "✅ magiskboot 就绪"
 
       - name: 应用 Droidspaces kABI 补丁
         run: |
@@ -196,8 +188,8 @@ jobs:
           export PATH="$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
           cd kernel_workspace
 
-          # ===== 1. 解包原厂 boot.img =====
-          echo "正在解包原厂 boot.img..."
+          # ===== 1. 解包 LineageOS 24 官方 boot.img =====
+          echo "正在解包 LineageOS 24 官方 boot.img..."
           mkdir -p unpack_dir
           cd unpack_dir
           ../magiskboot unpack ../stock_boot.img
@@ -210,8 +202,8 @@ jobs:
           echo "✅ 解包成功，unpack_dir 内容："
           ls -la unpack_dir/
 
-          # ===== 2. 提取原厂 .config =====
-          echo "正在用 extract-ikconfig 提取原厂配置..."
+          # ===== 2. 提取 LineageOS 24 原厂 .config (自适应核心) =====
+          echo "正在用 extract-ikconfig 提取 LineageOS 24 原厂配置..."
           cd common
           mkdir -p out
           ./scripts/extract-ikconfig ../unpack_dir/kernel > out/.config 2>/dev/null || true
@@ -219,35 +211,18 @@ jobs:
 
           CONFIG_LINES=$(wc -l < common/out/.config 2>/dev/null || echo "0")
           if [ "$CONFIG_LINES" -gt 1000 ]; then
-            echo "✅ 成功提取原厂 .config (共 $CONFIG_LINES 行)！"
+            echo "✅ 成功提取 LineageOS 24 原厂 .config (共 $CONFIG_LINES 行)！"
             echo "原厂 CONFIG_LOCALVERSION:"
             grep '^CONFIG_LOCALVERSION=' common/out/.config || echo "  (未设置)"
-            echo "原厂 CONFIG_IKCONFIG:"
-            grep '^CONFIG_IKCONFIG' common/out/.config || echo "  (未设置)"
-
+            
             # 保存提取的原厂配置，用于后续对比
             cp common/out/.config common/stock_extracted.config
-
-            # 快照原厂 =y 和 =m 的符号列表
-            grep -E '^CONFIG_[A-Z0-9_]+=y' common/stock_extracted.config | cut -d= -f1 | sort > common/orig_y_list.txt
-            grep -E '^CONFIG_[A-Z0-9_]+=m' common/stock_extracted.config | cut -d= -f1 | sort > common/orig_m_list.txt
-            echo "原厂 =y 项数: $(wc -l < common/orig_y_list.txt)"
-            echo "原厂 =m 项数: $(wc -l < common/orig_m_list.txt)"
           else
-            echo "::warning::未能从原厂 boot.img 提取配置（可能原厂未开启 CONFIG_IKCONFIG 或 kernel 格式不支持）。"
-            echo "正在回退到 gki_defconfig + vendor merge 方案..."
-            cd common
-            make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-              CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out \
-              KCFLAGS+=-O2 KCFLAGS+=-Wno-error gki_defconfig
-            ARCH=arm64 ./scripts/kconfig/merge_config.sh -m -O out \
-              out/.config \
-              arch/arm64/configs/vendor/sun_perf.config \
-              arch/arm64/configs/vendor/oplus/sun_perf.config
-            cd ..
+            echo "::error::未能从 LineageOS 24 boot.img 提取配置，提取失败！"
+            exit 1
           fi
 
-          # ===== 3. 微创注入 =====
+          # ===== 3. 微创注入 Droidspaces 必需配置 =====
           echo "正在执行微创手术：添加 Droidspaces 缺失配置..."
           ./common/scripts/config --file ./common/out/.config \
             --enable NAMESPACES \
@@ -260,72 +235,13 @@ jobs:
             --enable IKCONFIG \
             --enable IKCONFIG_PROC
 
-          # ===== 4. olddefconfig =====
+          # ===== 4. olddefconfig 解决依赖 =====
           cd common
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out olddefconfig
           cd ..
 
-          # ===== 5. 配置变化统计（只读，不阻断） =====
-          if [ -f common/stock_extracted.config ] && [ -f common/orig_y_list.txt ]; then
-            echo "========================================="
-            echo "配置变化统计（原厂 vs 新配置）"
-            echo "========================================="
-
-            grep -E '^CONFIG_[A-Z0-9_]+=y' common/out/.config | cut -d= -f1 | sort > common/new_y_list.txt
-            grep -E '^CONFIG_[A-Z0-9_]+=[my]' common/out/.config | cut -d= -f1 | sort > common/new_my_list.txt
-
-            ORIG_Y=$(wc -l < common/orig_y_list.txt)
-            NEW_Y=$(wc -l < common/new_y_list.txt)
-
-            comm -23 common/orig_y_list.txt common/new_y_list.txt > common/lost_y.txt
-            LOST_Y=$(wc -l < common/lost_y.txt)
-
-            comm -13 common/orig_y_list.txt common/new_y_list.txt > common/added_y.txt
-            ADDED_Y=$(wc -l < common/added_y.txt)
-
-            echo "原厂 =y 项数:       $ORIG_Y"
-            echo "新配置 =y 项数:     $NEW_Y"
-            echo "丢失（原厂有→无）: $LOST_Y"
-            echo "新增（原厂无→有）: $ADDED_Y"
-
-            if [ "$LOST_Y" -gt 0 ]; then
-              echo ""
-              echo "丢失项列表（前 30 个）："
-              head -30 common/lost_y.txt
-
-              HW_LOST=$(grep -cE 'CONFIG_(DRM|VIDEO|INPUT|SOUND|NET|USB|MMC|SCSI|POWER|REGULATOR|CLK|I2C|SPI|GPIO|PINCONF|THERMAL|HWMON|LEDS|BACKLIGHT|BATTERY|CHARGER|PHY|PCIE|UFS|NAND|MTD)_' common/lost_y.txt || echo "0")
-              if [ "$HW_LOST" -gt 0 ]; then
-                echo ""
-                echo "其中硬件相关丢失项："
-                grep -E 'CONFIG_(DRM|VIDEO|INPUT|SOUND|NET|USB|MMC|SCSI|POWER|REGULATOR|CLK|I2C|SPI|GPIO|PINCONF|THERMAL|HWMON|LEDS|BACKLIGHT|BATTERY|CHARGER|PHY|PCIE|UFS|NAND|MTD)_' common/lost_y.txt | head -30
-              fi
-            fi
-
-            if [ "$LOST_Y" -gt 50 ]; then
-              echo "::warning::丢失 $LOST_Y 个原厂 =y 项，源码版本可能偏差较大，刷入后请重点测硬件。"
-            elif [ "$LOST_Y" -gt 10 ]; then
-              echo "::notice::丢失 $LOST_Y 个原厂 =y 项，属正常版本差异范围。"
-            else
-              echo "✅ 丢失极少 ($LOST_Y)，源码版本高度匹配。"
-            fi
-
-            if [ -f common/orig_m_list.txt ]; then
-              comm -23 common/orig_m_list.txt common/new_my_list.txt > common/lost_m.txt
-              LOST_M=$(wc -l < common/lost_m.txt)
-              echo ""
-              echo "丢失的原厂 =m 项数: $LOST_M"
-              if [ "$LOST_M" -gt 0 ]; then
-                echo "丢失模块项（前 20 个）："
-                head -20 common/lost_m.txt
-                echo "::warning::丢失 $LOST_M 个原厂模块项，对应 .ko 可能无法加载，刷入后留意硬件。"
-              fi
-            fi
-          else
-            echo "::notice::未提取到原厂配置，跳过配置变化统计。"
-          fi
-
-          # ===== 6. 断言检查 =====
+          # ===== 5. 断言检查 (确保配置生效) =====
           echo "========================================="
           echo "正在执行断言检查 (验证 olddefconfig 后的最终配置)..."
           echo "========================================="
@@ -399,7 +315,7 @@ jobs:
             echo "  [ℹ] 原厂 boot.img 无 ramdisk（ramdisk 可能在 init_boot 中）"
           fi
 
-          # 3.2 DTB 校验（动态检测 dtb / kernel_dtb）
+          # 3.2 DTB 校验
           DTB_CHECKED=0
           for DTB_FILE in dtb kernel_dtb; do
             if [ -f "../unpack_dir/$DTB_FILE" ]; then
@@ -420,7 +336,7 @@ jobs:
             fi
           done
           if [ "$DTB_CHECKED" -eq 0 ]; then
-            echo "  [ℹ] 原厂 boot.img 无独立 dtb（dtb 可能在 vendor_boot.img 中，本次修改不涉及）"
+            echo "  [ℹ] 原厂 boot.img 无独立 dtb（dtb 可能在 vendor_boot.img 中）"
           fi
 
           # 3.3 Kernel 替换提示
@@ -431,8 +347,6 @@ jobs:
               echo "  [✓] Kernel 替换校验通过（未压缩，md5 一致）"
             else
               echo "  [ℹ] Kernel md5 不同（原厂可能是压缩格式，magiskboot 自动压缩了新 Image，属正常）"
-              echo "      新 Image:   $HASH_IMG"
-              echo "      包内 kernel: $HASH_KERNEL"
             fi
           fi
 
@@ -451,11 +365,11 @@ jobs:
           cd ..
 
           # ===== 4. 输出最终文件 =====
-          BOOTIMG_NAME="droidspaces-extract-boot.img"
+          BOOTIMG_NAME="droidspaces-lineageos24-boot.img"
           mv new-boot.img "${BOOTIMG_NAME}"
           echo "bootimg_name=${BOOTIMG_NAME}" >> $GITHUB_OUTPUT
           ls -la "${BOOTIMG_NAME}"
-          echo "✅ boot.img 生成完成！注意：不含 Root，需自行获取 root 权限。"
+          echo "✅ boot.img 生成完成！"
 
       - name: 保存 ccache 缓存
         if: steps.ccache-restore.outputs.cache-hit != 'true'
@@ -471,61 +385,3 @@ jobs:
           name: ${{ steps.create_bootimg.outputs.bootimg_name }}
           path: kernel_workspace/${{ steps.create_bootimg.outputs.bootimg_name }}
           if-no-files-found: error
-
-  release:
-    needs: build
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    permissions:
-      contents: write
-      actions: read
-    steps:
-      - name: 下载 boot.img 工件
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ needs.build.outputs.bootimg_name }}
-          path: ./release
-
-      - name: 设置环境变量
-        run: |
-          FULL_VERSION="${{ env.KERNEL_VERSION }}.${{ env.SUB_VERSION }}"
-          echo "FULL_VERSION=$FULL_VERSION" >> $GITHUB_ENV
-          TIME="$(TZ='Asia/Shanghai' date +'%y%m%d%H%M%S')"
-          echo "TIME=$TIME" >> $GITHUB_ENV
-          echo "TAG_HEAD=LineageOS-23.2-hummer-Droidspaces" >> $GITHUB_ENV
-
-      - name: 创建 Release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          {
-            echo '### 📱 LineageOS 23.2 Kernel for hummer (Droidspaces 微创版)'
-            echo ''
-            echo "- **内核版本**: ${{ env.FULL_VERSION }}"
-            echo '- **目标设备**: OnePlus Ace 5 Pro (hummer)'
-            echo '- **变更**: 优先基于原厂 `.config` 提取，仅补 `PID_NS` / `IPC_NS` / `DEVTMPFS` 及其依赖链'
-            echo '- **Root 方案**: **本镜像不含 Root**，需自行获取 root 权限'
-            echo ''
-            echo '### 📱 刷入说明'
-            echo ''
-            echo '1. 下载下方的 `droidspaces-extract-boot.img`。'
-            echo '2. 自行获取 root 权限。'
-            echo '3. 刷入本镜像后重启，确认 root 可用。'
-            echo '4. 运行 Droidspaces。'
-            echo ''
-            echo '### 🔍 刷入后验证'
-            echo '```bash'
-            echo 'su'
-            echo 'zcat /proc/config.gz | grep -E "CONFIG_(NAMESPACES|PID_NS|IPC_NS|SYSVIPC)="'
-            echo 'unshare --pid --fork true; echo "pid_ns=$?"'
-            echo 'unshare --ipc --fork true; echo "ipc_ns=$?"'
-            echo '```'
-            echo ''
-            echo '⚠️ **免责声明**: 刷写第三方内核存在风险。若刷入后无法开机，请通过 fastboot 刷回原厂 boot.img。'
-          } > release_notes.md
-
-          gh release create "${{ env.TAG_HEAD }}-${{ env.TIME }}" \
-            --repo "${{ github.repository }}" \
-            --title "${{ env.TAG_HEAD }}-v${{ env.TIME }}" \
-            --notes-file release_notes.md \
-            release/*.img
