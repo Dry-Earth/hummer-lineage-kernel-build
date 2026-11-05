@@ -9,28 +9,55 @@
 
 同时保持 kABI 和 `vermagic`，让 `vendor_dlkm` / `system_dlkm` 里的原厂模块继续加载。
 
-编译参数对应你当前的内核：
+## 构建结果 ✅
 
 | 项目 | 值 |
 |---|---|
 | 机型 | OnePlus Ace 5 Pro / `hummer` |
-| ROM | LineageOS 24.0 |
+| ROM | LineageOS 24.0（20261030） |
 | 内核仓库 | `LineageOS/android_kernel_oneplus_sm8750` |
 | 分支 | `lineage-24.0` |
 | 精确 commit | `6350e8af3f4c452d087fbd6fe1aabe03cbc0af75` |
-| 目标 release | `6.6.144-4k-g6350e8af3f4c` |
-| 官方 boot.img | `mirrors.ustc.edu.cn/lineageos/full/hummer/20261030/boot.img` |
+| modules 仓库 | `LineageOS/android_kernel_oneplus_sm8750-modules` @ `e05c031ce1512477f2d5db7bfa26a859adfcfbc7` |
+| 目标 release / vermagic | `6.6.144-4k-g6350e8af3f4c` ✅ |
+| 官方 boot.img | `mirrorbits.lineageos.org/full/hummer/20261030/boot.img` |
+| 官方 boot sha256 | `826353bfa49cc58fbc04d71b1cf07bbbc58151049d7fbab73f3b77ac3a29938c` |
 | 编译容器 | `ghcr.io/ylarod/ddk-min:android15-6.6-20260313`（clang r510928） |
+| 成功 run | https://github.com/Dry-Earth/hummer-lineage-kernel-build/actions/runs/42054473850 |
+
+**下载（Release 直链，不需要登录 Actions）：**
+
+- 编译后的 boot：https://github.com/Dry-Earth/hummer-lineage-kernel-build/releases/download/boot-42054473850/new-boot.img
+- 官方原版 boot（回滚用）：https://github.com/Dry-Earth/hummer-lineage-kernel-build/releases/download/boot-42054473850/stock-boot.img
+- Release 页面：https://github.com/Dry-Earth/hummer-lineage-kernel-build/releases/tag/boot-42054473850
+
+| 文件 | 大小 | sha256 |
+|---|---|---|
+| `new-boot.img` | 100663296 | `e37a88fa74846764b414bd08922702d3462312c56c4d755803b58f5ba4e63ae7` |
+| `stock-boot.img` | 100663296 | `826353bfa49cc58fbc04d71b1cf07bbbc58151049d7fbab73f3b77ac3a29938c` |
+
+构建日志已确认：
+
+```
+CONFIG_SYSVIPC=y
+CONFIG_POSIX_MQUEUE=y
+CONFIG_IPC_NS=y
+CONFIG_PID_NS=y
+Linux version 6.6.144-4k-g6350e8af3f4c
+```
 
 ## 目录内容
 
 ```
 .github/workflows/build-hummer-boot.yml   # 云端编译流程
+.github/workflows/publish-boot.yml        # 把已有构建产物发成 Release（不重编）
 patches/0001-sysvipc-kabi.patch           # Droidspaces 官方 kABI padding 补丁
 config/README.md                          # 可选的 /proc/config.gz 说明
 ```
 
-## 为什么只编 Image
+## 关键点
+
+### 1. 为什么只编 Image
 
 LineageOS 的 `vendor_dlkm` / `system_dlkm` 模块是预编译的，加载时会检查：
 
@@ -52,67 +79,44 @@ workflow 已经做了这两件事：
 **不要**顺手打开 `CONFIG_CFS_BANDWIDTH` / `CONFIG_CGROUP_PIDS`。
 这两个会改结构体大小，没有 padding 能救，必须全量重编所有 vendor 模块并刷多个分区。
 
-## 用法
+### 2. 为什么必须同时检出 modules 仓库
 
-### 1. 建仓库
+内核源码里这些路径是**符号链接**，指向 `../../../../sm8750-modules/...`：
 
-当前这台机器没有装 `git` / `gh`，所以需要你在网页上操作，或者先装 git。
-
-**网页方式**
-
-1. 在 GitHub 新建一个仓库，例如 `hummer-kernel-ci`（public / private 都行）。
-2. 打开仓库页面 → **Add file → Upload files**。
-3. 把这个 `hummer-kernel-ci` 目录里的内容拖进去：
-   - `.github/workflows/build-hummer-boot.yml`
-   - `patches/0001-sysvipc-kabi.patch`
-   - `config/README.md`
-   - `README.md`
-4. Commit。
-
-注意 `.github` 是隐藏目录，Windows 资源管理器里要开启“显示隐藏项目”，
-或者直接把整个文件夹拖进浏览器上传。
-
-**git 方式**
-
-```bash
-winget install --id Git.Git -e
-cd hummer-kernel-ci
-git init -b main
-git add .
-git commit -m "hummer kernel ci"
-git remote add origin https://github.com/<你的用户名>/hummer-kernel-ci.git
-git push -u origin main
+```
+drivers/soc/oplus/{boot,device_info,dfr,dft,fpga_notify,mdmrst,multimedia,storage,trackpoint}
+drivers/base/kernelFwUpdate
 ```
 
-### 2.（可选，强烈建议）放设备当前 config
+workflow 会把 modules 仓库检出到 `kernel` 的**同级目录** `sm8750-modules`，
+再挂载到容器里的 `/sm8750-modules`，否则会出现：
+
+```
+drivers/base/Kconfig:245: can't open file "drivers/base/kernelFwUpdate/Kconfig"
+make[6]: *** No rule to make target '../drivers/soc/oplus/boot/Makefile'
+```
+
+### 3. 配置来源
+
+优先级：
+
+1. `config/hummer_config.gz`（设备 `/proc/config.gz`，最稳）——本仓库目前**没有**放
+2. 按 LineageOS `TARGET_KERNEL_CONFIG` 顺序合并（当前使用）：
+   ```
+   gki_defconfig
+   + vendor/sun_perf.config
+   + vendor/oplus/sun_perf.config
+   ```
+   然后只改上面 4 个选项。
+
+如果想以后做到 100% 对齐设备当前 config，可以：
 
 ```bash
 adb shell su -c "cp /proc/config.gz /sdcard/hummer_config.gz"
 adb pull /sdcard/hummer_config.gz hummer-kernel-ci/config/hummer_config.gz
 ```
 
-把这个文件也提交。有它时 workflow 直接以**当前内核的真实 config** 为基线，
-只改 4 个选项，最稳。
-
-没有它也能编，workflow 会按 LineageOS 的顺序合并：
-
-```
-gki_defconfig
-+ vendor/sun_perf.config
-+ vendor/oplus/sun_perf.config
-```
-
-### 3. 运行
-
-GitHub 仓库 → **Actions** → 左侧 **Build hummer kernel boot.img** → **Run workflow**。
-
-大概需要 40–90 分钟（4 核 runner，KASAN + CFI 比较慢）。
-
-成功后在该次 run 的 **Artifacts** 下载：
-
-- `new-boot.img` ← 要刷的
-- `stock-boot.img` ← 官方原版，回滚用
-- `Image`、`config.final`、`System.map.final`、`build-info.txt`
+把文件提交到仓库，下次构建会自动优先使用它。
 
 ## 刷机
 
@@ -167,16 +171,23 @@ fastboot flash boot stock-boot.img
 fastboot reboot
 ```
 
-`stock-boot.img` 就是仓库 artifact 里那份，和 20261030 官方 boot 完全一致。
+`stock-boot.img` 和 20261030 官方 boot 完全一致（sha256 已校验）。
 
-## 注意事项
+## 以后重新构建
 
-- **OTA 会覆盖 boot**：以后每次 LineageOS 更新，如果内核 SHA 变了，需要同步改
-  `KERNEL_SHA` 和 `STOCK_BOOT_URL` 再重新编；不要拿旧内核配新系统。
-- 第一次刷完如果卡开机，长按电源键强制重启进 fastboot，刷回 `stock-boot.img`。
-- 这个方案只解决命名空间 + SysV IPC + POSIX mqueue；
-  `--cpus` / `--pids-limit` 仍然不可用（需要 `CFS_BANDWIDTH` / `CGROUP_PIDS` 全量重编）。
-- 构建失败先看日志里是哪一步：
-  - `patch` 失败：说明内核源码和预期不一致，确认 `KERNEL_SHA`
-  - `grep CONFIG_...=y` 失败：看 `olddefconfig` 是否把某个选项关掉
-  - 链接/OOM：把 workflow 里的 `-j$(nproc)` 改成 `-j2`
+- GitHub 仓库 → **Actions** → **Build hummer kernel boot.img** → **Run workflow**
+- 实际耗时约 **20 分钟**（4 核 runner）
+- 成功后在该 run 的 **Artifacts** 下载，或者再跑一次
+  **Publish built boot.img as release**（输入 run_id）生成 Release 直链。
+
+OTA 注意：每次 LineageOS 更新，如果内核 SHA 变了，需要同步改
+`KERNEL_SHA`、`STOCK_BOOT_URL`、`STOCK_BOOT_SHA256`、`MODULES_SHA` 再重新编；
+不要拿旧内核配新系统。
+
+## 排错
+
+- `patch` 失败：内核源码和预期不一致，确认 `KERNEL_SHA`
+- `grep CONFIG_...=y` 失败：看 `olddefconfig` 是否把某个选项关掉
+- `can't open file .../kernelFwUpdate/Kconfig`：modules 仓库没检出或没挂载到 `/sm8750-modules`
+- 下载 boot.img 403：换 `mirrorbits` / USTC 源，workflow 已内置双源 + sha256 校验
+- 链接/OOM：把 workflow 里的 `-j$(nproc)` 改成 `-j2`
