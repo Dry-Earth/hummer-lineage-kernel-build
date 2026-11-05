@@ -67,15 +67,15 @@ jobs:
               clean_path="${path%/}"
               [ -z "$clean_path" ] && continue
               
-              # 如果它不是一个合法的目录
-              if [ ! -d "$dir_prefix/$clean_path" ]; then
+              # 【修复点】如果它不是一个合法的目录，或者目录存在但是里面没有 Makefile
+              if [ ! -d "$dir_prefix/$clean_path" ] || [ ! -f "$dir_prefix/$clean_path/Makefile" ]; then
                 # 如果存在同名文件，先改名备份，防止误删有用的配置
                 if [ -f "$dir_prefix/$clean_path" ]; then
                   echo "  -> [极限防守] 发现同名文件占用，改名备份: $dir_prefix/$clean_path -> ${clean_path}.bak"
                   mv "$dir_prefix/$clean_path" "$dir_prefix/${clean_path}.bak"
                 fi
                 
-                echo "  -> [Makefile] 移除缺失的目录引用: $dir_prefix/$clean_path"
+                echo "  -> [Makefile] 移除缺失或无效的目录引用: $dir_prefix/$clean_path"
                 sed -i "\|+=.*${clean_path}\([[:space:]]\|$\)|d" "$mfile"
               fi
             done
