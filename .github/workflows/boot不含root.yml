@@ -79,7 +79,7 @@ jobs:
             done
           done
 
-          # 2. 修复 Makefile 缺失目录引用 (增强版，干掉一加的 soc/oplus/boot)
+          # 2. 修复 Makefile 缺失目录引用 (终极排雷版，干掉 soc/oplus/boot)
           find drivers -name "Makefile" | while read -r mfile; do
             dir_prefix=$(dirname "$mfile")
             grep -oP '(?<=\+= )[\w\-]+(?=/)' "$mfile" | sort -u | while read -r dir; do
@@ -214,10 +214,9 @@ jobs:
             exit 1
           fi
 
-          # ===== 3. 注入 cctv18 实战验证过的 Droidspaces 配置 =====
-          echo "正在执行微创手术：注入经过实战验证的容器配置..."
+          # ===== 3. 注入实战验证过的 Droidspaces 配置 (去除了无源码的 NTSYNC) =====
+          echo "正在执行微创手术：注入容器配置..."
           
-          # 基础容器功能与 NTSYNC
           ./common/scripts/config --file ./common/out/.config \
             --enable PID_NS \
             --enable IPC_NS \
@@ -226,12 +225,11 @@ jobs:
             --enable DEVTMPFS \
             --enable NAMESPACES \
             --enable POSIX_MQUEUE \
-            --enable NTSYNC \
             --enable MULTIUSER \
             --enable IKCONFIG \
             --enable IKCONFIG_PROC
 
-          # 网络匹配增强 (来自 cctv18 的 better_net)
+          # 网络匹配增强
           ./common/scripts/config --file ./common/out/.config \
             --enable NETFILTER_XT_MATCH_ADDRTYPE \
             --enable NETFILTER_XT_TARGET_LOG \
@@ -244,10 +242,10 @@ jobs:
             CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out olddefconfig
           cd ..
 
-          # ===== 5. 断言检查 =====
+          # ===== 5. 断言检查 (去除了 NTSYNC) =====
           echo "正在执行断言检查..."
           ASSERT_PASS=true
-          for CONFIG in CONFIG_PID_NS CONFIG_IPC_NS CONFIG_USER_NS CONFIG_SYSVIPC CONFIG_DEVTMPFS CONFIG_NAMESPACES CONFIG_POSIX_MQUEUE CONFIG_NTSYNC CONFIG_NETFILTER_XT_MATCH_ADDRTYPE; do
+          for CONFIG in CONFIG_PID_NS CONFIG_IPC_NS CONFIG_USER_NS CONFIG_SYSVIPC CONFIG_DEVTMPFS CONFIG_NAMESPACES CONFIG_POSIX_MQUEUE CONFIG_NETFILTER_XT_MATCH_ADDRTYPE; do
             if grep -q "^${CONFIG}=y" common/out/.config; then
               echo "  [✓] $CONFIG"
             else
