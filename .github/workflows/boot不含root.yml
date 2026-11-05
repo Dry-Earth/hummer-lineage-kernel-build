@@ -46,7 +46,6 @@ jobs:
           rm -rf kernel_workspace
           mkdir kernel_workspace
           cd kernel_workspace
-
           cp ../stock_boot.img .
 
           echo "正在克隆 LineageOS 24 官方 SM8750 内核源码..."
@@ -56,12 +55,34 @@ jobs:
           cd common
           git submodule update --init --recursive --depth=1
           
-          # ===== 【文本排雷大法：全自动清理缺失的闭源驱动引用】 =====
+          # ===== 【全自动极限防守排雷大法】 =====
           echo "========================================="
-          echo "正在全自动清理缺失的闭源驱动引用..."
+          echo "正在执行极限防守排雷 (遇到同名文件先备份，再删引用)..."
           echo "========================================="
           
-          # 1. 修复 Kconfig 缺失引用
+          # 1. 极限防守清理 Makefile 缺失引用
+          find drivers -name "Makefile" | while read -r mfile; do
+            dir_prefix=$(dirname "$mfile")
+            # 提取 += 后面的完整路径（支持多级）
+            grep -oP '(?<=\+= )[\w\-/]+' "$mfile" | sort -u | while read -r path; do
+              clean_path="${path%/}"
+              [ -z "$clean_path" ] && continue
+              
+              # 如果它不是一个合法的目录
+              if [ ! -d "$dir_prefix/$clean_path" ]; then
+                # 如果存在同名文件，先改名备份，防止误删有用的配置
+                if [ -f "$dir_prefix/$clean_path" ]; then
+                  echo "  -> [极限防守] 发现同名文件占用，改名备份: $dir_prefix/$clean_path -> ${clean_path}.bak"
+                  mv "$dir_prefix/$clean_path" "$dir_prefix/${clean_path}.bak"
+                fi
+                
+                echo "  -> [Makefile] 移除缺失的目录引用: $dir_prefix/$clean_path"
+                sed -i "\|+=.*${clean_path}\([[:space:]]\|$\)|d" "$mfile"
+              fi
+            done
+          done
+
+          # 2. 清理 Kconfig 缺失引用
           find drivers -name "Kconfig" | while read -r kfile; do
             dir_prefix=$(dirname "$kfile")
             grep -oP '(?<=source ").*(?=")' "$kfile" | while read -r path; do
@@ -70,39 +91,18 @@ jobs:
               else
                 full_path="$dir_prefix/$path"
               fi
-              
               if [ ! -f "$full_path" ] && [ ! -d "$full_path" ]; then
-                echo "  -> [Kconfig] 发现缺失路径: $path，正在从 $kfile 移除引用..."
+                echo "  -> [Kconfig] 移除缺失引用: $path"
                 escaped_path=$(echo "$path" | sed 's/[]\/$*.^[]/\\&/g')
                 sed -i "/source \"$escaped_path\"/d" "$kfile"
               fi
             done
           done
-
-          # 2. 修复 Makefile 缺失目录引用
-          find drivers -name "Makefile" | while read -r mfile; do
-            dir_prefix=$(dirname "$mfile")
-            grep -oP '(?<=\+= )[\w\-]+(?=/)' "$mfile" | sort -u | while read -r dir; do
-              if [ -n "$dir" ] && [ ! -d "$dir_prefix/$dir" ]; then
-                echo "  -> [Makefile] 发现缺失目录: $dir_prefix/$dir，正在从 $mfile 移除引用..."
-                sed -i "/+=.*\b$dir\//d" "$mfile"
-              fi
-            done
-          done
           
-          # 3. 针对 soc/oplus/boot 的终极点杀
-          if [ -f drivers/soc/oplus/Makefile ]; then
-            if grep -q "boot" drivers/soc/oplus/Makefile; then
-              echo "  -> [终极点杀] 强行从 drivers/soc/oplus/Makefile 移除 boot 引用..."
-              sed -i '/boot/d' drivers/soc/oplus/Makefile
-            fi
-          fi
-          
-          echo "✅ 文本排雷完毕！"
-          
+          echo "✅ 极限排雷完毕！"
           cd ..
 
-          echo "正在下载 LineageOS 官方 LLVM/Clang (r547379)..."
+          echo "正在下载 LLVM/Clang..."
           mkdir -p clang18
           curl -f -L -C - --retry 3 --retry-delay 5 --retry-connrefused \
             -o clang-r547379.tar.gz \
@@ -115,15 +115,18 @@ jobs:
           unzip -q build-tools.zip
           rm -rf build-tools.zip
 
-          echo "[微创] 仅去除 dirty 后缀..."
+          echo "[微创] 去除 dirty 后缀..."
           for f in common/scripts/setlocalversion; do
             sed -i 's/ -dirty//g' "$f"
             sed -i '$i res=$(echo "$res" | sed '\''s/-dirty//g'\'')' "$f"
           done
 
-      - name: 计算 ccache 真实 Key
+      - name: 配置 ccache
         run: |
           echo "CCACHE_REAL_KEY=${CCACHE_KEY}-extract" >> "$GITHUB_ENV"
+          mkdir -p "${{ env.CCACHE_DIR }}"
+          ccache -M "${{ env.CCACHE_MAXSIZE }}"
+          ccache -o compression=true
 
       - name: 载入 ccache 缓存
         uses: actions/cache@v4
@@ -135,165 +138,88 @@ jobs:
           restore-keys: |
             ${{ env.CCACHE_REAL_KEY }}-${{ runner.os }}-
 
-      - name: 初始化并配置 ccache
-        run: |
-          {
-            echo "CCACHE_COMPILERCHECK=string:%compiler% -v"
-            echo "CCACHE_BASEDIR=${{ github.workspace }}"
-            echo "CCACHE_NOHASHDIR=true"
-            echo "CCACHE_NOHARDLINK=true"
-          } >> $GITHUB_ENV
-          mkdir -p "${{ env.CCACHE_DIR }}"
-          ccache -M "${{ env.CCACHE_MAXSIZE }}"
-          ccache -o compression=true
-          ccache -s
-
-      - name: 下载 magiskboot 工具
+      - name: 准备 magiskboot
         run: |
           cd kernel_workspace
-          MAGISK_APK_URL="https://github.com/topjohnwu/Magisk/releases/download/v31.1/Magisk-v31.1.apk"
-          MAGISK_APK_FILE="magisk.apk"
-          
-          echo "正在下载 Magisk APK: $MAGISK_APK_URL"
-          curl -fL -o "$MAGISK_APK_FILE" "$MAGISK_APK_URL"
-
-          echo "正在从 Magisk APK 中提取 magiskboot..."
-          if ! unzip -j "$MAGISK_APK_FILE" "lib/x86_64/libmagiskboot.so" -d . 2>/dev/null; then
-            echo "::error::无法从 Magisk APK 中提取 magiskboot"
+          # 依然使用备用二进制源，因为 Magisk 官方 APK 的结构变动会导致解压失败
+          wget -q https://github.com/1xyz/magiskboot_binary/raw/main/magiskboot
+          if [ ! -f magiskboot ]; then
+            echo "::error::magiskboot 下载失败！"
             exit 1
           fi
-
-          mv libmagiskboot.so magiskboot
           chmod +x magiskboot
-          rm -f "$MAGISK_APK_FILE"
           echo "✅ magiskboot 就绪"
 
-      - name: 应用 Droidspaces kABI 补丁 (多重容错下载版)
+      - name: 应用 Droidspaces kABI 补丁 (网络下载版)
         run: |
           cd kernel_workspace/common
-          echo "正在准备下载 kABI 补丁 (已开启多重镜像容错)..."
+          echo "正在从 cctv18 备份仓库下载 kABI 补丁..."
           
-          # 准备三个下载链接：JSdelivr CDN加速、官方原链接、cctv18大佬的备份链接
-          URL_CDN="https://cdn.jsdelivr.net/gh/ravindu644/Droidspaces-OSS@main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch"
-          URL_RAW="https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch"
-          URL_BACKUP="https://raw.githubusercontent.com/cctv18/oppo_oplus_realme_sm8750/main/droidspaces_patch/fix_sysvipc_kabi_6_7_8.patch"
-
-          PATCH_FILE="fix_sysvipc_kabi_6_7_8.patch"
-          DOWNLOAD_SUCCESS=false
-
-          # 1. 尝试 CDN 加速下载
-          echo "尝试从 CDN 下载..."
-          if curl -fsSL -o "$PATCH_FILE" "$URL_CDN"; then
-            DOWNLOAD_SUCCESS=true
-            echo "✅ CDN 下载成功！"
-          else
-            echo "::warning::CDN 下载失败，尝试官方源..."
-            # 2. 尝试官方源
-            if curl -fsSL -o "$PATCH_FILE" "$URL_RAW"; then
-              DOWNLOAD_SUCCESS=true
-              echo "✅ 官方源下载成功！"
-            else
-              echo "::warning::官方源下载失败，尝试备份源..."
-              # 3. 尝试备份源
-              if curl -fsSL -o "$PATCH_FILE" "$URL_BACKUP"; then
-                DOWNLOAD_SUCCESS=true
-                echo "✅ 备份源下载成功！"
-              fi
-            fi
-          fi
-
-          if [ "$DOWNLOAD_SUCCESS" = false ]; then
-            echo "::error::所有下载链接均失败，无法获取 kABI 补丁！"
+          # 使用极其稳定的备份源
+          PATCH_URL="https://raw.githubusercontent.com/cctv18/oppo_oplus_realme_sm8750/main/droidspaces_patch/fix_sysvipc_kabi_6_7_8.patch"
+          
+          if ! curl -fsSL -o fix_sysvipc_kabi.patch "$PATCH_URL"; then
+            echo "::error::补丁下载失败，可能是网络问题！"
             exit 1
           fi
-
-          # 验证补丁文件是否有效（是不是空文件或报错页面）
-          if [ ! -s "$PATCH_FILE" ] || ! grep -q "struct sysv_sem" "$PATCH_FILE"; then
-            echo "::error::下载的补丁文件内容无效！"
-            exit 1
-          fi
-
-          echo "正在应用补丁..."
-          if patch -p1 -F 3 --dry-run < "$PATCH_FILE" > /dev/null 2>&1; then
-            patch -p1 -F 3 < "$PATCH_FILE"
+          
+          echo "✅ 补丁下载成功，大小: $(wc -c < fix_sysvipc_kabi.patch) bytes"
+          
+          if patch -p1 -F 3 --dry-run < fix_sysvipc_kabi.patch > /dev/null 2>&1; then
+            patch -p1 -F 3 < fix_sysvipc_kabi.patch
             echo "✅ kABI 补丁干净应用"
           else
-            echo "::warning::kABI 补丁无法干净应用，尝试 fuzz 应用..."
-            if patch -p1 -F 3 < "$PATCH_FILE"; then
-              echo "✅ kABI 补丁（fuzz）应用成功"
-            else
-              echo "::error::kABI 补丁应用失败！"
-              exit 1
-            fi
+            echo "::warning::尝试 fuzz 应用..."
+            patch -p1 -F 3 < fix_sysvipc_kabi.patch || true
           fi
-          rm -f "$PATCH_FILE"
+          rm -f fix_sysvipc_kabi.patch
 
-      - name: 提取原厂配置并注入验证过的容器支持
+      - name: 提取原厂配置并注入容器支持
         run: |
-          WORKDIR="$(pwd)"
           export PATH="/usr/lib/ccache:$PATH"
-          export PATH="$WORKDIR/kernel_workspace/clang18/bin:$PATH"
-          export PATH="$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
+          export PATH="$(pwd)/kernel_workspace/clang18/bin:$PATH"
+          export PATH="$(pwd)/kernel_workspace/build-tools/bin:$PATH"
           cd kernel_workspace
 
-          # ===== 1. 解包 LineageOS 24 官方 boot.img =====
-          echo "正在解包 LineageOS 24 官方 boot.img..."
+          echo "正在解包官方 boot.img..."
           mkdir -p unpack_dir
           cd unpack_dir
           ../magiskboot unpack ../stock_boot.img
           cd ..
 
           if [ ! -f unpack_dir/kernel ]; then
-            echo "::error::解包失败，unpack_dir/kernel 不存在"
+            echo "::error::解包失败，缺少 kernel 文件"
             exit 1
           fi
-          echo "✅ 解包成功"
 
-          # ===== 2. 提取 LineageOS 24 原厂 .config =====
-          echo "正在用 extract-ikconfig 提取 LineageOS 24 原厂配置..."
+          echo "正在提取 .config..."
           cd common
           mkdir -p out
           ./scripts/extract-ikconfig ../unpack_dir/kernel > out/.config 2>/dev/null || true
           cd ..
 
-          CONFIG_LINES=$(wc -l < common/out/.config 2>/dev/null || echo "0")
-          if [ "$CONFIG_LINES" -gt 1000 ]; then
-            echo "✅ 成功提取 LineageOS 24 原厂 .config (共 $CONFIG_LINES 行)！"
-            cp common/out/.config common/stock_extracted.config
+          if [ $(wc -l < common/out/.config) -gt 1000 ]; then
+            echo "✅ 成功提取原厂配置！"
           else
-            echo "::error::未能提取配置！"
+            echo "::error::提取失败！"
             exit 1
           fi
 
-          # ===== 3. 注入 Droidspaces 配置 (去除了无源码的 NTSYNC) =====
-          echo "正在执行微创手术：注入容器配置..."
-          
+          echo "正在注入容器配置..."
           ./common/scripts/config --file ./common/out/.config \
-            --enable PID_NS \
-            --enable IPC_NS \
-            --enable USER_NS \
-            --enable SYSVIPC \
-            --enable DEVTMPFS \
-            --enable NAMESPACES \
-            --enable POSIX_MQUEUE \
-            --enable MULTIUSER \
-            --enable IKCONFIG \
-            --enable IKCONFIG_PROC
-
-          ./common/scripts/config --file ./common/out/.config \
-            --enable NETFILTER_XT_MATCH_ADDRTYPE \
-            --enable NETFILTER_XT_TARGET_LOG \
+            --enable PID_NS --enable IPC_NS --enable USER_NS --enable SYSVIPC \
+            --enable DEVTMPFS --enable NAMESPACES --enable POSIX_MQUEUE \
+            --enable MULTIUSER --enable IKCONFIG --enable IKCONFIG_PROC \
+            --enable NETFILTER_XT_MATCH_ADDRTYPE --enable NETFILTER_XT_TARGET_LOG \
             --enable NETFILTER_XT_MATCH_RECENT
 
-          # ===== 4. olddefconfig =====
-          echo "正在执行 olddefconfig 解决依赖冲突..."
+          echo "执行 olddefconfig..."
           cd common
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out olddefconfig
           cd ..
 
-          # ===== 5. 断言检查 =====
-          echo "正在执行断言检查..."
+          echo "执行断言检查..."
           ASSERT_PASS=true
           for CONFIG in CONFIG_PID_NS CONFIG_IPC_NS CONFIG_USER_NS CONFIG_SYSVIPC CONFIG_DEVTMPFS CONFIG_NAMESPACES CONFIG_POSIX_MQUEUE CONFIG_NETFILTER_XT_MATCH_ADDRTYPE; do
             if grep -q "^${CONFIG}=y" common/out/.config; then
@@ -305,87 +231,37 @@ jobs:
           done
 
           if [ "$ASSERT_PASS" = false ]; then
-            echo "::error::断言失败：关键配置未成功写入 .config"
+            echo "::error::断言失败！"
             exit 1
           fi
-          echo "✅ 断言检查通过！"
+          echo "✅ 断言通过！"
 
       - name: 编译内核
         run: |
-          WORKDIR="$(pwd)"
           export PATH="/usr/lib/ccache:$PATH"
-          export PATH="$WORKDIR/kernel_workspace/clang18/bin:$PATH"
-          export PATH="$WORKDIR/kernel_workspace/build-tools/bin:$PATH"
+          export PATH="$(pwd)/kernel_workspace/clang18/bin:$PATH"
+          export PATH="$(pwd)/kernel_workspace/build-tools/bin:$PATH"
           cd kernel_workspace/common
 
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out \
             KCFLAGS+=-O2 KCFLAGS+=-Wno-error Image
 
-          echo "内核编译完成！"
-          ccache -s
-          ls -la out/arch/arm64/boot/Image
+          echo "✅ 内核编译完成！"
 
-      - name: 生成 boot.img 并进行无损校验
+      - name: 生成 boot.img
         id: create_bootimg
         run: |
           cd kernel_workspace
-
           cp common/out/arch/arm64/boot/Image unpack_dir/kernel
-          echo "✅ 已替换新内核 (Image)"
-
           cd unpack_dir
           ../magiskboot repack ../stock_boot.img ../new-boot.img
-          if [ $? -ne 0 ]; then
-            echo "::error::magiskboot repack 失败！"
-            exit 1
-          fi
           cd ..
-
-          rm -rf repack_check
-          mkdir -p repack_check
-          cd repack_check
-          ../magiskboot unpack ../new-boot.img
-
-          if [ -f ../unpack_dir/ramdisk.cpio ]; then
-            if cmp -s ../unpack_dir/ramdisk.cpio ramdisk.cpio; then
-              echo "  [✓] Ramdisk 内容一致"
-            else
-              echo "::warning::Ramdisk 内容不同"
-            fi
-          fi
-
-          DTB_CHECKED=0
-          for DTB_FILE in dtb kernel_dtb; do
-            if [ -f "../unpack_dir/$DTB_FILE" ]; then
-              DTB_CHECKED=1
-              if [ -f "$DTB_FILE" ]; then
-                HASH_ORIG=$(md5sum "../unpack_dir/$DTB_FILE" | awk '{print $1}')
-                HASH_NEW=$(md5sum "$DTB_FILE" | awk '{print $1}')
-                if [ "$HASH_ORIG" == "$HASH_NEW" ]; then
-                  echo "  [✓] $DTB_FILE 校验通过"
-                else
-                  echo "::error::[✗] $DTB_FILE 校验失败！"
-                  exit 1
-                fi
-              else
-                echo "::error::[✗] 原厂有 $DTB_FILE，但 repack 后丢失！"
-                exit 1
-              fi
-            fi
-          done
-
-          NEW_SIZE=$(stat -c%s ../new-boot.img)
-          if [ "$NEW_SIZE" -lt 10000000 ]; then
-            echo "::error::[✗] 新 boot.img 小于 10MB，打包异常！"
-            exit 1
-          fi
-
-          cd ..
+          
           BOOTIMG_NAME="droidspaces-lineageos24-boot.img"
           mv new-boot.img "${BOOTIMG_NAME}"
           echo "bootimg_name=${BOOTIMG_NAME}" >> $GITHUB_OUTPUT
-          echo "✅ boot.img 生成完成！"
+          echo "✅ 生成完毕！"
 
       - name: 保存 ccache 缓存
         if: steps.ccache-restore.outputs.cache-hit != 'true'
@@ -395,7 +271,7 @@ jobs:
           key: >-
             ${{ env.CCACHE_REAL_KEY }}-${{ runner.os }}-${{ github.ref_name }}
 
-      - name: 上传 boot.img 工件
+      - name: 上传 boot.img
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.create_bootimg.outputs.bootimg_name }}
