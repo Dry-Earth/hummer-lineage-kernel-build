@@ -1,0 +1,181 @@
+name: Build hummer kernel boot.img
+
+# 目标：只编译 Image，然后替换进官方 boot.img。
+# 不编译 vendor/system_dlkm 模块，靠保持 ABI + vermagic 让原厂模块继续加载。
+#
+# 手动触发：Actions -> Build hummer kernel boot.img -> Run workflow
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  KERNEL_REPO: LineageOS/android_kernel_oneplus_sm8750
+  KERNEL_BRANCH: lineage-24.0
+  KERNEL_SHA: 6350e8af3f4c452d087fbd6fe1aabe03cbc0af75
+  EXPECTED_RELEASE: 6.6.144-4k-g6350e8af3f4c
+  STOCK_BOOT_URL: https://mirrors.ustc.edu.cn/lineageos/full/hummer/20261030/boot.img
+  DDK_IMAGE: ghcr.io/ylarod/ddk-min:android15-6.6-20260313
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+
+    steps:
+      - name: Free disk space
+        run: |
+          set -eux
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h
+
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Clone kernel source at the exact SHA
+        run: |
+          set -eux
+          git clone --depth 1 --no-tags --branch "$KERNEL_BRANCH" \
+            "https://github.com/${KERNEL_REPO}.git" kernel
+          cd kernel
+          actual=$(git rev-parse HEAD)
+          echo "HEAD=$actual"
+          test "$actual" = "$KERNEL_SHA"
+
+      - name: Apply SYSVIPC kABI padding patch
+        run: |
+          set -eux
+          cd kernel
+          patch -p1 --forward < ../patches/0001-sysvipc-kabi.patch
+          grep -n "ANDROID_KABI_USE(6, struct sysv_sem sysvsem)" include/linux/sched.h
+
+      - name: Pull DDK toolchain (clang r510928)
+        run: |
+          set -eux
+          docker pull "$DDK_IMAGE"
+
+      - name: Configure and build Image
+        env:
+          KERNELRELEASE: ${{ env.EXPECTED_RELEASE }}
+        run: |
+          set -eux
+          docker run --rm \
+            -v "$PWD/kernel:/kernel" \
+            -v "$PWD/config:/config:ro" \
+            -w /kernel \
+            -e KERNELRELEASE \
+            "$DDK_IMAGE" \
+            bash -c '
+              set -euxo pipefail
+              export ARCH=arm64
+              export LLVM=1
+              export LLVM_IAS=1
+              export CROSS_COMPILE=aarch64-linux-gnu-
+              mkdir -p out
+
+              if [ -s /config/hummer_config.gz ]; then
+                echo "==> 使用 config/hummer_config.gz 作为基线（推荐）"
+                zcat /config/hummer_config.gz > out/.config
+              else
+                echo "==> 没有 config.gz，按 LineageOS 的 TARGET_KERNEL_CONFIG 顺序生成"
+                make O=out gki_defconfig
+                scripts/kconfig/merge_config.sh -m -O out out/.config \
+                  arch/arm64/configs/vendor/sun_perf.config
+                make O=out olddefconfig
+                scripts/kconfig/merge_config.sh -m -O out out/.config \
+                  arch/arm64/configs/vendor/oplus/sun_perf.config
+                make O=out olddefconfig
+              fi
+
+              echo "==> 打开 PID_NS / IPC_NS / SYSVIPC / POSIX_MQUEUE"
+              scripts/config --file out/.config \
+                -e PID_NS \
+                -e IPC_NS \
+                -e SYSVIPC \
+                -e POSIX_MQUEUE
+              make O=out olddefconfig
+
+              for c in PID_NS IPC_NS SYSVIPC POSIX_MQUEUE; do
+                grep -q "^CONFIG_${c}=y$" out/.config
+              done
+              grep -E "^CONFIG_(PID_NS|IPC_NS|SYSVIPC|POSIX_MQUEUE|LOCALVERSION|LOCALVERSION_AUTO)=" out/.config
+
+              echo "==> building Image"
+              make O=out -j"$(nproc)" KERNELRELEASE="$KERNELRELEASE" Image
+
+              echo "==> 校验版本字符串"
+              test "$(make -s O=out KERNELRELEASE="$KERNELRELEASE" kernelrelease)" = "$KERNELRELEASE"
+              grep -q "$KERNELRELEASE" out/include/generated/utsrelease.h
+              grep -a -q "Linux version $KERNELRELEASE" out/arch/arm64/boot/Image
+
+              echo "==> 构建产物"
+              ls -lh out/arch/arm64/boot/Image
+              cp out/.config out/config.final
+              cp out/System.map out/System.map.final
+            '
+
+      - name: Download stock boot.img and magiskboot
+        run: |
+          set -eux
+          mkdir -p bootwork
+          curl -fL --retry 3 -o bootwork/stock-boot.img "$STOCK_BOOT_URL"
+          curl -fL --retry 3 -o Magisk.apk \
+            https://github.com/topjohnwu/Magisk/releases/download/v31.1/Magisk-v31.1.apk
+          unzip -o Magisk.apk lib/x86_64/libmagiskboot.so -d magisk
+          install -m 755 magisk/lib/x86_64/libmagiskboot.so bootwork/magiskboot
+          ls -lh bootwork/stock-boot.img bootwork/magiskboot
+
+      - name: Repack boot.img with the new Image
+        working-directory: bootwork
+        env:
+          # 把 boot.img 内嵌 vbmeta 的 flags 改成 3（禁用 verity/verification）
+          PATCHVBMETAFLAG: "1"
+        run: |
+          set -eux
+          ./magiskboot unpack stock-boot.img
+          ls -lh
+          cp ../kernel/out/arch/arm64/boot/Image kernel
+          ./magiskboot repack stock-boot.img new-boot.img
+          stock_size=$(stat -c %s stock-boot.img)
+          new_size=$(stat -c %s new-boot.img)
+          if [ "$new_size" -lt "$stock_size" ]; then
+            truncate -s "$stock_size" new-boot.img
+          fi
+          sha256sum stock-boot.img new-boot.img
+          ls -lh new-boot.img
+
+      - name: Write build info
+        run: |
+          set -eux
+          {
+            echo "kernel repo:   https://github.com/${KERNEL_REPO}"
+            echo "kernel branch: ${KERNEL_BRANCH}"
+            echo "kernel sha:    ${KERNEL_SHA}"
+            echo "release:       ${EXPECTED_RELEASE}"
+            echo "stock boot:    ${STOCK_BOOT_URL}"
+            echo "ddk image:     ${DDK_IMAGE}"
+            echo
+            echo "config (enabled options):"
+            grep -E "^CONFIG_(PID_NS|IPC_NS|SYSVIPC|POSIX_MQUEUE)=" kernel/out/config.final
+          } > build-info.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hummer-boot-${{ github.run_id }}
+          if-no-files-found: error
+          path: |
+            bootwork/new-boot.img
+            bootwork/stock-boot.img
+            kernel/out/arch/arm64/boot/Image
+            kernel/out/config.final
+            kernel/out/System.map.final
+            build-info.txt
