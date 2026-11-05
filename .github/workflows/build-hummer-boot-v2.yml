@@ -1,0 +1,399 @@
+name: Build hummer boot.img v2 (stock config + container/network)
+
+# 这是“第二版”构建流程，和已经验证过的 build-hummer-boot.yml 并存，互不影响。
+#
+# 吸收了 boot不含root.yml 里最有价值的思路：
+#   1. 先从原厂 boot.img / 已提交的 config 里读出设备“原本就支持什么”
+#   2. 只补充原厂缺失的容器/网络选项，已经 =y 的不重复改
+#   3. 每项都记录 stock 值 -> 最终值，并生成 config.diff
+#   4. ccache 复用，缩短二次构建时间
+#
+# 仍然保持：
+#   - 内核固定 commit 6350e8af3f4c...，modules 固定 e05c031c...
+#   - 强制 KERNELRELEASE=6.6.144-4k-g6350e8af3f4c
+#   - 先打 Droidspaces SYSVIPC kABI 补丁
+#   - 只替换 boot.img 里的 Image，ramdisk 不动（不带 root）
+
+on:
+  workflow_dispatch:
+    inputs:
+      optional_network:
+        description: '补充可选的容器网络功能（IPv6 NAT / Macvlan / UFW / Fail2ban / tmpfs xattr）'
+        required: true
+        type: boolean
+        default: true
+      enable_user_ns:
+        description: '开启 USER_NS（Docker 的 unsafe procfs 修复，非必需）'
+        required: true
+        type: boolean
+        default: false
+      use_merged_config:
+        description: '忽略原厂 config，改用 gki+vendor 合并配置（仅排障用）'
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  KERNEL_REPO: LineageOS/android_kernel_oneplus_sm8750
+  KERNEL_BRANCH: lineage-24.0
+  KERNEL_SHA: 6350e8af3f4c452d087fbd6fe1aabe03cbc0af75
+  MODULES_REPO: LineageOS/android_kernel_oneplus_sm8750-modules
+  MODULES_BRANCH: lineage-24.0
+  MODULES_SHA: e05c031ce1512477f2d5db7bfa26a859adfcfbc7
+  EXPECTED_RELEASE: 6.6.144-4k-g6350e8af3f4c
+
+  # 官方 boot.img：优先用仓库缓存（和官方 sha256 完全一致），再回退官方镜像
+  STOCK_BOOT_URL_CACHED: https://github.com/Dry-Earth/hummer-lineage-kernel-build/releases/download/test-assets/stock-boot.img
+  STOCK_BOOT_URL: https://mirrorbits.lineageos.org/full/hummer/20261030/boot.img
+  STOCK_BOOT_URL_FALLBACK: https://mirrors.ustc.edu.cn/lineageos/full/hummer/20261030/boot.img
+  STOCK_BOOT_SHA256: 826353bfa49cc58fbc04d71b1cf07bbbc58151049d7fbab73f3b77ac3a29938c
+  STOCK_BOOT_SIZE: "100663296"
+
+  MAGISKBOOT_URL_CACHED: https://github.com/Dry-Earth/hummer-lineage-kernel-build/releases/download/test-assets/libmagiskboot-x86_64.so
+  MAGISK_APK_URL: https://github.com/topjohnwu/Magisk/releases/download/v31.1/Magisk-v31.1.apk
+
+  # 原厂 Image 里的编译器字符串是 clang r596125 (22.0.2)。
+  # 编译器版本不参与 vermagic / genksyms CRC，这里仍用已验证的 DDK r510928。
+  DDK_IMAGE: ghcr.io/ylarod/ddk-min:android15-6.6-20260313
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+
+    steps:
+      - name: Free disk space
+        run: |
+          set -eux
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h
+
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Clone kernel source at the exact SHA
+        run: |
+          set -eux
+          mkdir -p kernel
+          cd kernel
+          git init -q
+          git remote add origin "https://github.com/${KERNEL_REPO}.git"
+          if ! git fetch --depth 1 --no-tags origin "$KERNEL_SHA"; then
+            echo "::warning::fetch by SHA failed, falling back to a deeper branch fetch"
+            git fetch --no-tags --depth 200 origin "$KERNEL_BRANCH"
+          fi
+          git checkout -q "$KERNEL_SHA" 2>/dev/null || git checkout -q FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$KERNEL_SHA"
+
+      - name: Clone modules source (sibling of kernel) at the exact SHA
+        run: |
+          set -eux
+          mkdir -p sm8750-modules
+          cd sm8750-modules
+          git init -q
+          git remote add origin "https://github.com/${MODULES_REPO}.git"
+          if ! git fetch --depth 1 --no-tags origin "$MODULES_SHA"; then
+            echo "::warning::fetch by SHA failed, falling back to a deeper branch fetch"
+            git fetch --no-tags --depth 200 origin "$MODULES_BRANCH"
+          fi
+          git checkout -q "$MODULES_SHA" 2>/dev/null || git checkout -q FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$MODULES_SHA"
+
+      - name: Check for broken symlinks in kernel tree
+        run: |
+          set -eu
+          broken=0
+          while IFS= read -r link; do
+            target=$(readlink "$link")
+            case "$target" in
+              /*) resolved="$target" ;;
+              *)  resolved="$(dirname "$link")/$target" ;;
+            esac
+            if [ ! -e "$resolved" ]; then
+              echo "BROKEN: $link -> $target"
+              broken=$((broken + 1))
+            fi
+          done < <(find kernel -type l)
+          echo "broken symlinks: $broken"
+          if [ "$broken" -gt 0 ]; then
+            echo "::warning::$broken broken symlinks remain in the kernel tree"
+          fi
+
+      - name: Apply SYSVIPC kABI padding patch
+        run: |
+          set -eux
+          cd kernel
+          patch -p1 --forward < ../patches/0001-sysvipc-kabi.patch
+          grep -n "ANDROID_KABI_USE(6, struct sysv_sem sysvsem)" include/linux/sched.h
+
+      - name: Download stock boot.img and magiskboot
+        run: |
+          set -eux
+          mkdir -p bootwork
+          ok=0
+          for u in "$STOCK_BOOT_URL_CACHED" "$STOCK_BOOT_URL" "$STOCK_BOOT_URL_FALLBACK"; do
+            echo "==> 尝试下载 $u"
+            if curl -fL --retry 3 --retry-all-errors --connect-timeout 20 \
+                 -A "Mozilla/5.0" -o bootwork/stock-boot.img "$u"; then
+              size=$(stat -c %s bootwork/stock-boot.img)
+              echo "downloaded $size bytes"
+              if [ "$size" = "$STOCK_BOOT_SIZE" ]; then ok=1; break; fi
+              echo "size mismatch, 换下一个源"
+            fi
+          done
+          test "$ok" = "1"
+          echo "$STOCK_BOOT_SHA256  bootwork/stock-boot.img" | sha256sum -c -
+
+          if curl -fL --retry 3 --retry-all-errors -o bootwork/magiskboot "$MAGISKBOOT_URL_CACHED"; then
+            chmod +x bootwork/magiskboot
+          else
+            curl -fL --retry 3 --retry-all-errors -o Magisk.apk "$MAGISK_APK_URL"
+            unzip -o Magisk.apk lib/x86_64/libmagiskboot.so -d magisk
+            install -m 755 magisk/lib/x86_64/libmagiskboot.so bootwork/magiskboot
+          fi
+          chmod +x bootwork/magiskboot
+
+      - name: Read the config the stock kernel actually ships
+        run: |
+          set -eux
+          mkdir -p build-config kernel/out
+          cd bootwork
+          ./magiskboot unpack stock-boot.img
+          ls -lh kernel
+
+          if [ "${{ inputs.use_merged_config }}" = "true" ]; then
+            echo "merged" > source.txt
+          elif sh ../kernel/scripts/extract-ikconfig kernel > ../build-config/stock.config 2>/dev/null \
+               && grep -q '^CONFIG_' ../build-config/stock.config; then
+            echo "stock_boot" > source.txt
+          elif [ -s ../config/hummer_config.gz ]; then
+            zcat ../config/hummer_config.gz > ../build-config/stock.config
+            echo "repo_config" > source.txt
+          else
+            echo "merged" > source.txt
+          fi
+
+          if [ "$(cat source.txt)" != "merged" ]; then
+            test "$(grep -c '^CONFIG_' ../build-config/stock.config)" -gt 1000
+            cp ../build-config/stock.config ../kernel/out/.config
+            cp ../build-config/stock.config ../kernel/out/.config.stock
+            echo "==> 配置基线: $(cat source.txt) ($(grep -c '^CONFIG_' ../build-config/stock.config) 项)"
+          else
+            echo "==> 配置基线: gki_defconfig + vendor 配置合并"
+          fi
+          echo "$(cat source.txt)" > ../build-config/source.txt
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: hummer-v2-ccache-${{ env.KERNEL_SHA }}-${{ hashFiles('config/hummer_config.gz') }}-${{ inputs.optional_network }}-${{ inputs.enable_user_ns }}
+          restore-keys: |
+            hummer-v2-ccache-${{ env.KERNEL_SHA }}-
+            hummer-v2-ccache-
+
+      - name: Pull DDK toolchain (clang r510928)
+        run: docker pull "$DDK_IMAGE"
+
+      - name: Configure (only add what stock is missing) and build Image
+        env:
+          KERNELRELEASE: ${{ env.EXPECTED_RELEASE }}
+          OPTIONAL_NETWORK: ${{ inputs.optional_network }}
+          ENABLE_USER_NS: ${{ inputs.enable_user_ns }}
+        run: |
+          set -eux
+          mkdir -p .ccache
+          docker run --rm \
+            -v "$PWD/kernel:/kernel" \
+            -v "$PWD/sm8750-modules:/sm8750-modules" \
+            -v "$PWD/.ccache:/ccache" \
+            -v "$PWD/build-config:/build-config:ro" \
+            -w /kernel \
+            -e KERNELRELEASE \
+            -e OPTIONAL_NETWORK \
+            -e ENABLE_USER_NS \
+            -e CCACHE_DIR=/ccache \
+            -e CCACHE_BASEDIR=/kernel \
+            -e CCACHE_COMPRESS=1 \
+            -e CCACHE_MAXSIZE=3G \
+            "$DDK_IMAGE" \
+            bash -c '
+              set -euxo pipefail
+              export ARCH=arm64
+              export LLVM=1
+              export LLVM_IAS=1
+              export CROSS_COMPILE=aarch64-linux-gnu-
+              mkdir -p out
+
+              source_kind=$(cat /build-config/source.txt 2>/dev/null || echo merged)
+              if [ -s out/.config ] && [ "$source_kind" != "merged" ]; then
+                echo "==> 使用原厂 config 作为基线 ($source_kind)"
+              else
+                echo "==> 没有可用原厂 config，按 LineageOS 顺序合并"
+                rm -f out/.config
+                make O=out gki_defconfig
+                scripts/kconfig/merge_config.sh -m -O out out/.config \
+                  arch/arm64/configs/vendor/sun_perf.config
+                make O=out olddefconfig
+                scripts/kconfig/merge_config.sh -m -O out out/.config \
+                  arch/arm64/configs/vendor/oplus/sun_perf.config
+                make O=out olddefconfig
+              fi
+              cp out/.config out/.config.stock
+
+              REQUIRED="SYSVIPC POSIX_MQUEUE IPC_NS PID_NS DEVTMPFS NETFILTER_XT_MATCH_ADDRTYPE"
+              OPTIONAL_NET="IP6_NF_NAT IP6_NF_TARGET_MASQUERADE MACVLAN \
+                NETFILTER_XT_TARGET_REJECT NETFILTER_XT_TARGET_LOG NETFILTER_XT_MATCH_RECENT \
+                IP_SET IP_SET_HASH_IP IP_SET_HASH_NET NETFILTER_XT_SET \
+                TMPFS_POSIX_ACL TMPFS_XATTR"
+
+              enable_opt() {
+                opt=$1
+                if grep -q "^CONFIG_${opt}=y$" out/.config; then
+                  echo "  [keep]    $opt 已经是 y"
+                elif grep -q "^CONFIG_${opt}=m$" out/.config; then
+                  echo "  [promote] $opt 由 m 改为 y"
+                  scripts/config --file out/.config -e "$opt"
+                else
+                  echo "  [add]     $opt"
+                  scripts/config --file out/.config -e "$opt"
+                fi
+              }
+
+              echo "==> 原厂缺失、必须补充的选项"
+              for o in $REQUIRED; do enable_opt "$o"; done
+
+              if [ "$OPTIONAL_NETWORK" = "true" ]; then
+                echo "==> 可选容器网络选项"
+                for o in $OPTIONAL_NET; do enable_opt "$o"; done
+              fi
+
+              if [ "$ENABLE_USER_NS" = "true" ]; then
+                echo "==> 可选 USER_NS"
+                enable_opt USER_NS
+              fi
+
+              make O=out olddefconfig
+
+              echo "==> 断言：必须为 y 的选项"
+              fail=0
+              for o in $REQUIRED; do
+                if grep -q "^CONFIG_${o}=y$" out/.config; then
+                  echo "  [ok]   $o"
+                else
+                  echo "  [FAIL] $o 未开启"
+                  fail=1
+                fi
+              done
+              test "$fail" = "0"
+
+              echo "==> 断言：不能开启的选项（会破坏 kABI）"
+              for o in CFS_BANDWIDTH CGROUP_PIDS NF_TABLES NET_L3_MASTER_DEV; do
+                if grep -q "^CONFIG_${o}=y$" out/.config; then
+                  echo "  [FAIL] $o 不应该开启"
+                  fail=1
+                else
+                  echo "  [ok]   $o 未开启"
+                fi
+              done
+              test "$fail" = "0"
+
+              echo "==> 配置变化（原厂 -> 最终）"
+              {
+                for o in $REQUIRED $OPTIONAL_NET USER_NS; do
+                  b=$(grep -E "^(# )?CONFIG_${o}(=| is not set)" out/.config.stock | head -n1 || true)
+                  a=$(grep -E "^(# )?CONFIG_${o}(=| is not set)" out/.config | head -n1 || true)
+                  [ -z "$b" ] && b="(absent)"
+                  [ -z "$a" ] && a="(absent)"
+                  echo "$o | $b | $a"
+                done
+              } | tee out/config.report.txt
+              diff -u out/.config.stock out/.config > out/config.diff || true
+              echo "changed config lines: $(grep -cE '^[+-]CONFIG_|^[+-]# CONFIG_' out/config.diff || true)"
+
+              echo "==> building Image"
+              ccache_arg=()
+              if command -v ccache >/dev/null 2>&1; then
+                echo "    ccache: $(ccache --version | head -n1)"
+                ccache_arg=(CC="ccache clang")
+              else
+                echo "    ccache 不在 DDK 镜像里，使用普通 clang"
+              fi
+              make O=out -j"$(nproc)" KERNELRELEASE="$KERNELRELEASE" "${ccache_arg[@]}" Image
+
+              echo "==> 校验 vermagic"
+              test "$(make -s O=out KERNELRELEASE="$KERNELRELEASE" kernelrelease)" = "$KERNELRELEASE"
+              grep -q "$KERNELRELEASE" out/include/generated/utsrelease.h
+              grep -a -q "Linux version $KERNELRELEASE" out/arch/arm64/boot/Image
+
+              cp out/.config out/config.final
+              cp out/System.map out/System.map.final
+              ls -lh out/arch/arm64/boot/Image
+            '
+
+      - name: Repack boot.img with the new Image
+        working-directory: bootwork
+        env:
+          PATCHVBMETAFLAG: "1"
+        run: |
+          set -eux
+          ./magiskboot unpack stock-boot.img
+          cp ../kernel/out/arch/arm64/boot/Image kernel
+          ./magiskboot repack stock-boot.img new-boot.img
+          stock_size=$(stat -c %s stock-boot.img)
+          new_size=$(stat -c %s new-boot.img)
+          if [ "$new_size" -gt "$stock_size" ]; then
+            echo "::error::new-boot.img ($new_size) 比原厂 boot 分区 ($stock_size) 还大"
+            exit 1
+          fi
+          if [ "$new_size" -lt "$stock_size" ]; then
+            truncate -s "$stock_size" new-boot.img
+          fi
+          sha256sum stock-boot.img new-boot.img
+          ls -lh new-boot.img
+
+      - name: Write build info
+        run: |
+          set -eux
+          {
+            echo "kernel repo:   https://github.com/${KERNEL_REPO}"
+            echo "kernel sha:    ${KERNEL_SHA}"
+            echo "modules sha:   ${MODULES_SHA}"
+            echo "release:       ${EXPECTED_RELEASE}"
+            echo "config source: $(cat build-config/source.txt)"
+            echo "optional net:  ${{ inputs.optional_network }}"
+            echo "user ns:       ${{ inputs.enable_user_ns }}"
+            echo "stock boot:    ${STOCK_BOOT_URL}"
+            echo "stock sha256:  ${STOCK_BOOT_SHA256}"
+            echo "ddk image:     ${DDK_IMAGE}"
+            echo
+            echo "required container options:"
+            grep -E "^CONFIG_(SYSVIPC|POSIX_MQUEUE|IPC_NS|PID_NS|DEVTMPFS|NETFILTER_XT_MATCH_ADDRTYPE)=" kernel/out/config.final || true
+            echo
+            echo "config report (option | stock | final):"
+            cat kernel/out/config.report.txt
+          } > build-info.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hummer-boot-v2-${{ github.run_id }}
+          if-no-files-found: error
+          path: |
+            bootwork/new-boot.img
+            bootwork/stock-boot.img
+            kernel/out/arch/arm64/boot/Image
+            kernel/out/config.final
+            kernel/out/config.diff
+            kernel/out/config.report.txt
+            kernel/out/System.map.final
+            build-info.txt
