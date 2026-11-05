@@ -37,14 +37,14 @@ jobs:
           tag="boot-${RUN_ID}"
           notes=$(cat artifact/build-info.txt 2>/dev/null || true)
           if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$tag" artifact/new-boot.img artifact/stock-boot.img \
+            gh release upload "$tag" artifact/bootwork/new-boot.img artifact/bootwork/stock-boot.img \
               -R "$GITHUB_REPOSITORY" --clobber
           else
             gh release create "$tag" \
-              artifact/new-boot.img \
-              artifact/stock-boot.img \
+              artifact/bootwork/new-boot.img \
+              artifact/bootwork/stock-boot.img \
               -R "$GITHUB_REPOSITORY" \
               --title "hummer boot image ($RUN_ID)" \
-              --notes "$notes"$'\n\nnew-boot.img sha256: '"$(sha256sum artifact/new-boot.img | cut -d' ' -f1)"
+              --notes "$notes"$'\n\nnew-boot.img sha256: '"$(sha256sum artifact/bootwork/new-boot.img | cut -d' ' -f1)"
           fi
           gh release view "$tag" -R "$GITHUB_REPOSITORY" --json url -q .url
