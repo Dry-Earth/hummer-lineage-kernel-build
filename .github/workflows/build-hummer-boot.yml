@@ -23,6 +23,10 @@ env:
   EXPECTED_RELEASE: 6.6.144-4k-g6350e8af3f4c
   STOCK_BOOT_URL: https://mirrorbits.lineageos.org/full/hummer/20261030/boot.img
   STOCK_BOOT_URL_FALLBACK: https://mirrors.ustc.edu.cn/lineageos/full/hummer/20261030/boot.img
+  # 仓库内缓存的官方 boot.img（和上面镜像完全一致，避免 mirror 403）
+  STOCK_BOOT_URL_CACHED: https://github.com/Dry-Earth/hummer-lineage-kernel-build/releases/download/test-assets/stock-boot.img
+  MAGISKBOOT_URL_CACHED: https://github.com/Dry-Earth/hummer-lineage-kernel-build/releases/download/test-assets/libmagiskboot-x86_64.so
+  MAGISK_APK_URL: https://github.com/topjohnwu/Magisk/releases/download/v31.1/Magisk-v31.1.apk
   # 来自 download.lineageos.org API，确保拿到的就是 20261030 官方 boot.img
   STOCK_BOOT_SHA256: 826353bfa49cc58fbc04d71b1cf07bbbc58151049d7fbab73f3b77ac3a29938c
   STOCK_BOOT_SIZE: "100663296"
@@ -179,7 +183,7 @@ jobs:
           set -eux
           mkdir -p bootwork
           ok=0
-          for u in "$STOCK_BOOT_URL" "$STOCK_BOOT_URL_FALLBACK"; do
+          for u in "$STOCK_BOOT_URL_CACHED" "$STOCK_BOOT_URL" "$STOCK_BOOT_URL_FALLBACK"; do
             echo "==> 尝试下载 $u"
             if curl -fL --retry 3 --retry-all-errors --connect-timeout 20 \
                  -A "Mozilla/5.0" -o bootwork/stock-boot.img "$u"; then
@@ -192,10 +196,15 @@ jobs:
           test "$ok" = "1"
           echo "$STOCK_BOOT_SHA256  bootwork/stock-boot.img" | sha256sum -c -
 
-          curl -fL --retry 3 --retry-all-errors -o Magisk.apk \
-            https://github.com/topjohnwu/Magisk/releases/download/v31.1/Magisk-v31.1.apk
-          unzip -o Magisk.apk lib/x86_64/libmagiskboot.so -d magisk
-          install -m 755 magisk/lib/x86_64/libmagiskboot.so bootwork/magiskboot
+          if curl -fL --retry 3 --retry-all-errors -o bootwork/magiskboot "$MAGISKBOOT_URL_CACHED"; then
+            echo "==> 使用仓库缓存的 magiskboot"
+            chmod +x bootwork/magiskboot
+          else
+            echo "==> 缓存不可用，从 Magisk APK 提取"
+            curl -fL --retry 3 --retry-all-errors -o Magisk.apk "$MAGISK_APK_URL"
+            unzip -o Magisk.apk lib/x86_64/libmagiskboot.so -d magisk
+            install -m 755 magisk/lib/x86_64/libmagiskboot.so bootwork/magiskboot
+          fi
           ls -lh bootwork/stock-boot.img bootwork/magiskboot
 
       - name: Repack boot.img with the new Image
