@@ -56,12 +56,12 @@ jobs:
           cd common
           git submodule update --init --recursive --depth=1
           
-          # 【核心防御】全自动清理缺失的闭源驱动 Kconfig/Makefile 引用 (排雷)
+          # 【核心防御】全自动清理缺失的闭源驱动 Kconfig/Makefile 引用 (终极排雷版)
           echo "========================================="
           echo "正在全自动清理缺失的闭源驱动引用..."
           echo "========================================="
           
-          # 1. 修复 Kconfig 缺失引用 (全自动扫描)
+          # 1. 修复 Kconfig 缺失引用
           find drivers -name "Kconfig" | while read -r kfile; do
             dir_prefix=$(dirname "$kfile")
             grep -oP '(?<=source ").*(?=")' "$kfile" | while read -r path; do
@@ -79,14 +79,13 @@ jobs:
             done
           done
 
-          # 2. 修复 Makefile 缺失目录引用 (全自动扫描)
+          # 2. 修复 Makefile 缺失目录引用 (增强版，干掉一加的 soc/oplus/boot)
           find drivers -name "Makefile" | while read -r mfile; do
             dir_prefix=$(dirname "$mfile")
-            grep -oP '(?<=obj-[ym] \+= )[\w\-]+(?=/)' "$mfile" | sort -u | while read -r dir; do
-              if [ ! -d "$dir_prefix/$dir" ]; then
-                echo "  -> [Makefile] 发现缺失目录: $dir_prefix/$dir，正在从 $mfile 移除..."
-                escaped_dir=$(echo "$dir" | sed 's/[]\/$*.^[]/\\&/g')
-                sed -i "/obj-[ym] += $escaped_dir\//d" "$mfile"
+            grep -oP '(?<=\+= )[\w\-]+(?=/)' "$mfile" | sort -u | while read -r dir; do
+              if [ -n "$dir" ] && [ ! -d "$dir_prefix/$dir" ]; then
+                echo "  -> [Makefile] 发现缺失目录: $dir_prefix/$dir，正在从 $mfile 移除引用..."
+                sed -i "/+=.*\b$dir\//d" "$mfile"
               fi
             done
           done
@@ -139,11 +138,9 @@ jobs:
           ccache -o compression=true
           ccache -s
 
-      - name: 下载 magiskboot 工具（仅用于解包/重打包 boot.img，与 Root 无关）
+      - name: 下载 magiskboot 工具
         run: |
           cd kernel_workspace
-          
-          # 【关键修复】使用固定的 v31.1 版本直链，彻底避开 GitHub API 403 和文件改名 404 的问题
           MAGISK_APK_URL="https://github.com/topjohnwu/Magisk/releases/download/v31.1/Magisk-v31.1.apk"
           MAGISK_APK_FILE="magisk.apk"
           
@@ -152,8 +149,6 @@ jobs:
 
           echo "正在从 Magisk APK 中提取 magiskboot..."
           if ! unzip -j "$MAGISK_APK_FILE" "lib/x86_64/libmagiskboot.so" -d . 2>/dev/null; then
-            echo "::warning::标准路径不存在，列出 APK 内 magiskboot 相关文件："
-            unzip -l "$MAGISK_APK_FILE" | grep -i magiskboot || true
             echo "::error::无法从 Magisk APK 中提取 magiskboot"
             exit 1
           fi
@@ -161,15 +156,12 @@ jobs:
           mv libmagiskboot.so magiskboot
           chmod +x magiskboot
           rm -f "$MAGISK_APK_FILE"
-          ./magiskboot --help > /dev/null 2>&1 || true
           echo "✅ magiskboot 就绪"
 
       - name: 应用 Droidspaces kABI 补丁
         run: |
           cd kernel_workspace/common
-          echo "========================================="
           echo "正在应用 Droidspaces GKI kABI 补丁..."
-          echo "========================================="
           curl -fLo fix_sysvipc_kabi_6_7_8.patch https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
 
           if patch -p1 -F 3 --dry-run < fix_sysvipc_kabi_6_7_8.patch > /dev/null 2>&1; then
@@ -180,12 +172,12 @@ jobs:
             if patch -p1 -F 3 < fix_sysvipc_kabi_6_7_8.patch; then
               echo "✅ kABI 补丁（fuzz）应用成功"
             else
-              echo "::warning::kABI 补丁应用失败。开 IPC_NS 后 kABI 可能不兼容，若刷入后崩溃请检查此补丁。"
+              echo "::warning::kABI 补丁应用失败。"
             fi
           fi
           rm -f fix_sysvipc_kabi_6_7_8.patch
 
-      - name: 提取原厂配置并执行微创手术
+      - name: 提取原厂配置并注入验证过的容器支持
         run: |
           WORKDIR="$(pwd)"
           export PATH="/usr/lib/ccache:$PATH"
@@ -204,8 +196,7 @@ jobs:
             echo "::error::解包失败，unpack_dir/kernel 不存在"
             exit 1
           fi
-          echo "✅ 解包成功，unpack_dir 内容："
-          ls -la unpack_dir/
+          echo "✅ 解包成功"
 
           # ===== 2. 提取 LineageOS 24 原厂 .config (自适应核心) =====
           echo "正在用 extract-ikconfig 提取 LineageOS 24 原厂配置..."
@@ -217,41 +208,46 @@ jobs:
           CONFIG_LINES=$(wc -l < common/out/.config 2>/dev/null || echo "0")
           if [ "$CONFIG_LINES" -gt 1000 ]; then
             echo "✅ 成功提取 LineageOS 24 原厂 .config (共 $CONFIG_LINES 行)！"
-            echo "原厂 CONFIG_LOCALVERSION:"
-            grep '^CONFIG_LOCALVERSION=' common/out/.config || echo "  (未设置)"
-            
-            # 保存提取的原厂配置，用于后续对比
             cp common/out/.config common/stock_extracted.config
           else
-            echo "::error::未能从 LineageOS 24 boot.img 提取配置，提取失败！"
+            echo "::error::未能提取配置！"
             exit 1
           fi
 
-          # ===== 3. 微创注入 Droidspaces 必需配置 =====
-          echo "正在执行微创手术：添加 Droidspaces 缺失配置..."
+          # ===== 3. 注入 cctv18 实战验证过的 Droidspaces 配置 =====
+          echo "正在执行微创手术：注入经过实战验证的容器配置..."
+          
+          # 基础容器功能与 NTSYNC
           ./common/scripts/config --file ./common/out/.config \
-            --enable NAMESPACES \
-            --enable MULTIUSER \
             --enable PID_NS \
             --enable IPC_NS \
+            --enable USER_NS \
             --enable SYSVIPC \
-            --enable POSIX_MQUEUE \
             --enable DEVTMPFS \
+            --enable NAMESPACES \
+            --enable POSIX_MQUEUE \
+            --enable NTSYNC \
+            --enable MULTIUSER \
             --enable IKCONFIG \
             --enable IKCONFIG_PROC
 
+          # 网络匹配增强 (来自 cctv18 的 better_net)
+          ./common/scripts/config --file ./common/out/.config \
+            --enable NETFILTER_XT_MATCH_ADDRTYPE \
+            --enable NETFILTER_XT_TARGET_LOG \
+            --enable NETFILTER_XT_MATCH_RECENT
+
           # ===== 4. olddefconfig 解决依赖 =====
+          echo "正在执行 olddefconfig 解决依赖冲突..."
           cd common
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out olddefconfig
           cd ..
 
-          # ===== 5. 断言检查 (确保配置生效) =====
-          echo "========================================="
-          echo "正在执行断言检查 (验证 olddefconfig 后的最终配置)..."
-          echo "========================================="
+          # ===== 5. 断言检查 =====
+          echo "正在执行断言检查..."
           ASSERT_PASS=true
-          for CONFIG in CONFIG_NAMESPACES CONFIG_MULTIUSER CONFIG_PID_NS CONFIG_IPC_NS CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE CONFIG_DEVTMPFS CONFIG_IKCONFIG CONFIG_IKCONFIG_PROC; do
+          for CONFIG in CONFIG_PID_NS CONFIG_IPC_NS CONFIG_USER_NS CONFIG_SYSVIPC CONFIG_DEVTMPFS CONFIG_NAMESPACES CONFIG_POSIX_MQUEUE CONFIG_NTSYNC CONFIG_NETFILTER_XT_MATCH_ADDRTYPE; do
             if grep -q "^${CONFIG}=y" common/out/.config; then
               echo "  [✓] $CONFIG"
             else
@@ -287,11 +283,9 @@ jobs:
         run: |
           cd kernel_workspace
 
-          # ===== 1. 替换 kernel =====
           cp common/out/arch/arm64/boot/Image unpack_dir/kernel
           echo "✅ 已替换新内核 (Image)"
 
-          # ===== 2. 重新打包 =====
           cd unpack_dir
           ../magiskboot repack ../stock_boot.img ../new-boot.img
           if [ $? -ne 0 ]; then
@@ -300,27 +294,19 @@ jobs:
           fi
           cd ..
 
-          # ===== 3. 重打包完整性校验 =====
-          echo "========================================="
-          echo "正在校验重打包后的 boot.img..."
-          echo "========================================="
           rm -rf repack_check
           mkdir -p repack_check
           cd repack_check
           ../magiskboot unpack ../new-boot.img
 
-          # 3.1 Ramdisk 校验
           if [ -f ../unpack_dir/ramdisk.cpio ]; then
             if cmp -s ../unpack_dir/ramdisk.cpio ramdisk.cpio; then
               echo "  [✓] Ramdisk 内容一致"
             else
-              echo "::warning::Ramdisk 内容不同（可能是 magiskboot 重新压缩，不一定有问题）"
+              echo "::warning::Ramdisk 内容不同"
             fi
-          else
-            echo "  [ℹ] 原厂 boot.img 无 ramdisk（ramdisk 可能在 init_boot 中）"
           fi
 
-          # 3.2 DTB 校验
           DTB_CHECKED=0
           for DTB_FILE in dtb kernel_dtb; do
             if [ -f "../unpack_dir/$DTB_FILE" ]; then
@@ -329,9 +315,9 @@ jobs:
                 HASH_ORIG=$(md5sum "../unpack_dir/$DTB_FILE" | awk '{print $1}')
                 HASH_NEW=$(md5sum "$DTB_FILE" | awk '{print $1}')
                 if [ "$HASH_ORIG" == "$HASH_NEW" ]; then
-                  echo "  [✓] $DTB_FILE 校验通过 (MD5: $HASH_ORIG)"
+                  echo "  [✓] $DTB_FILE 校验通过"
                 else
-                  echo "::error::[✗] $DTB_FILE 校验失败！数据已损坏或丢失！"
+                  echo "::error::[✗] $DTB_FILE 校验失败！"
                   exit 1
                 fi
               else
@@ -340,40 +326,17 @@ jobs:
               fi
             fi
           done
-          if [ "$DTB_CHECKED" -eq 0 ]; then
-            echo "  [ℹ] 原厂 boot.img 无独立 dtb（dtb 可能在 vendor_boot.img 中）"
-          fi
 
-          # 3.3 Kernel 替换提示
-          if [ -f kernel ]; then
-            HASH_IMG=$(md5sum ../common/out/arch/arm64/boot/Image | awk '{print $1}')
-            HASH_KERNEL=$(md5sum kernel | awk '{print $1}')
-            if [ "$HASH_IMG" == "$HASH_KERNEL" ]; then
-              echo "  [✓] Kernel 替换校验通过（未压缩，md5 一致）"
-            else
-              echo "  [ℹ] Kernel md5 不同（原厂可能是压缩格式，magiskboot 自动压缩了新 Image，属正常）"
-            fi
-          fi
-
-          # 3.4 文件大小检查 (修复了emoji乱码)
-          ORIG_SIZE=$(stat -c%s ../stock_boot.img)
           NEW_SIZE=$(stat -c%s ../new-boot.img)
-          echo "  [ℹ] 原厂 boot.img: $ORIG_SIZE bytes"
-          echo "  [ℹ] 新 boot.img:   $NEW_SIZE bytes"
-
           if [ "$NEW_SIZE" -lt 10000000 ]; then
             echo "::error::[✗] 新 boot.img 小于 10MB，打包异常！"
             exit 1
           fi
 
-          echo "✅ 无损校验完成！"
           cd ..
-
-          # ===== 4. 输出最终文件 =====
           BOOTIMG_NAME="droidspaces-lineageos24-boot.img"
           mv new-boot.img "${BOOTIMG_NAME}"
           echo "bootimg_name=${BOOTIMG_NAME}" >> $GITHUB_OUTPUT
-          ls -la "${BOOTIMG_NAME}"
           echo "✅ boot.img 生成完成！"
 
       - name: 保存 ccache 缓存
