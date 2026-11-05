@@ -143,8 +143,8 @@ jobs:
         run: |
           cd kernel_workspace
           
-          # 直接使用固定链接，规避 GitHub API 403 限制
-          MAGISK_APK_URL="https://github.com/topjohnwu/Magisk/releases/latest/download/app-release.apk"
+          # 【关键修复】使用固定的 v31.1 版本直链，彻底避开 GitHub API 403 和文件改名 404 的问题
+          MAGISK_APK_URL="https://github.com/topjohnwu/Magisk/releases/download/v31.1/Magisk-v31.1.apk"
           MAGISK_APK_FILE="magisk.apk"
           
           echo "正在下载 Magisk APK: $MAGISK_APK_URL"
@@ -152,7 +152,7 @@ jobs:
 
           echo "正在从 Magisk APK 中提取 magiskboot..."
           if ! unzip -j "$MAGISK_APK_FILE" "lib/x86_64/libmagiskboot.so" -d . 2>/dev/null; then
-            echo "::error::标准路径不存在，列出 APK 内 magiskboot 相关文件："
+            echo "::warning::标准路径不存在，列出 APK 内 magiskboot 相关文件："
             unzip -l "$MAGISK_APK_FILE" | grep -i magiskboot || true
             echo "::error::无法从 Magisk APK 中提取 magiskboot"
             exit 1
