@@ -4,12 +4,10 @@ env:
   TZ: Asia/Shanghai
   ANDROID_VERSION: 'android17'
   KERNEL_VERSION: '6.6'
-  # SUB_VERSION 留空或根据实际 LOS24 版本调整，extract-ikconfig 会自动处理核心配置
   SUB_VERSION: 'latest' 
   CCACHE_KEY: ccache-lineageos24-6.6-extract
   CCACHE_DIR: ${{ github.workspace }}/.ccache
   CCACHE_MAXSIZE: 5G
-  # 【关键更新】LineageOS 24 最新官方 boot.img 链接
   OFFICIAL_BOOT_URL: "https://mirrorbits.lineageos.org/full/hummer/20261030/boot.img"
 
 on:
@@ -51,7 +49,6 @@ jobs:
 
           cp ../stock_boot.img .
 
-          # 【关键更新】克隆 LineageOS 24 (lineage-24.0) 源码
           echo "正在克隆 LineageOS 24 官方 SM8750 内核源码..."
           git clone --depth=1 --branch lineage-24.0 https://github.com/LineageOS/android_kernel_oneplus_sm8750.git common
 
@@ -63,6 +60,8 @@ jobs:
           echo "========================================="
           echo "正在全自动清理缺失的闭源驱动引用..."
           echo "========================================="
+          
+          # 清理 drivers/base/Kconfig
           if [ -f drivers/base/Kconfig ]; then
             grep -oP '(?<=source ").*(?=")' drivers/base/Kconfig | while read -r path; do
               if [ ! -f "$path" ] && [[ "$path" == drivers/base/* ]]; then
@@ -73,6 +72,7 @@ jobs:
             done
           fi
 
+          # 清理 drivers/base/Makefile
           if [ -f drivers/base/Makefile ]; then
             grep -oP '(?<=obj-[ym] \+= )[\w\-]+(?=/)' drivers/base/Makefile | sort -u | while read -r dir; do
               if [ ! -d "drivers/base/$dir" ]; then
@@ -81,6 +81,15 @@ jobs:
               fi
             done
           fi
+          
+          # 【新增】清理 drivers/misc/Kconfig 中的 haptic_feedback 引用
+          if [ -f drivers/misc/Kconfig ]; then
+            if grep -q "drivers/misc/vibrator/haptic_feedback/Kconfig" drivers/misc/Kconfig; then
+              echo "  -> 发现缺失路径: drivers/misc/vibrator/haptic_feedback/Kconfig，正在自动移除引用..."
+              sed -i '/source "drivers\/misc\/vibrator\/haptic_feedback\/Kconfig"/d' drivers/misc/Kconfig
+            fi
+          fi
+          
           cd ..
 
           echo "正在下载 LineageOS 官方 LLVM/Clang (r547379)..."
@@ -353,7 +362,7 @@ jobs:
           # 3.4 文件大小检查
           ORIG_SIZE=$(stat -c%s ../stock_boot.img)
           NEW_SIZE=$(stat -c%s ../new-boot.img)
-          echo "  [ℹ] 原厂 boot.img: $ORIG_SIZE bytes"
+          echo "  [] 原厂 boot.img: $ORIG_SIZE bytes"
           echo "  [ℹ] 新 boot.img:   $NEW_SIZE bytes"
 
           if [ "$NEW_SIZE" -lt 10000000 ]; then
