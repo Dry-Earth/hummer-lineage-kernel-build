@@ -27,6 +27,11 @@ on:
         required: true
         type: boolean
         default: false
+      enable_ipv6_nat:
+        description: '开启 IPv6 NAT（NAT66）；部分 OPPO/一加机型可能触发 VINTF 提示'
+        required: true
+        type: boolean
+        default: false
       use_merged_config:
         description: '忽略原厂 config，改用 gki+vendor 合并配置（仅排障用）'
         required: true
@@ -196,7 +201,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .ccache
-          key: hummer-v2-ccache-${{ env.KERNEL_SHA }}-${{ hashFiles('config/hummer_config.gz') }}-${{ inputs.optional_network }}-${{ inputs.enable_user_ns }}
+          key: hummer-v2-ccache-${{ env.KERNEL_SHA }}-${{ hashFiles('config/hummer_config.gz') }}-${{ inputs.optional_network }}-${{ inputs.enable_user_ns }}-${{ inputs.enable_ipv6_nat }}
           restore-keys: |
             hummer-v2-ccache-${{ env.KERNEL_SHA }}-
             hummer-v2-ccache-
@@ -209,6 +214,7 @@ jobs:
           KERNELRELEASE: ${{ env.EXPECTED_RELEASE }}
           OPTIONAL_NETWORK: ${{ inputs.optional_network }}
           ENABLE_USER_NS: ${{ inputs.enable_user_ns }}
+          ENABLE_IPV6_NAT: ${{ inputs.enable_ipv6_nat }}
         run: |
           set -eux
           mkdir -p .ccache
@@ -221,6 +227,7 @@ jobs:
             -e KERNELRELEASE \
             -e OPTIONAL_NETWORK \
             -e ENABLE_USER_NS \
+            -e ENABLE_IPV6_NAT \
             -e CCACHE_DIR=/ccache \
             -e CCACHE_BASEDIR=/kernel \
             -e CCACHE_COMPRESS=1 \
@@ -251,7 +258,7 @@ jobs:
               cp out/.config out/.config.stock
 
               REQUIRED="SYSVIPC POSIX_MQUEUE IPC_NS PID_NS DEVTMPFS NETFILTER_XT_MATCH_ADDRTYPE"
-              OPTIONAL_NET="IP6_NF_NAT IP6_NF_TARGET_MASQUERADE MACVLAN \
+              OPTIONAL_NET="MACVLAN \
                 NETFILTER_XT_TARGET_REJECT NETFILTER_XT_TARGET_LOG NETFILTER_XT_MATCH_RECENT \
                 IP_SET IP_SET_HASH_IP IP_SET_HASH_NET NETFILTER_XT_SET \
                 TMPFS_POSIX_ACL TMPFS_XATTR"
@@ -282,6 +289,12 @@ jobs:
                 enable_opt USER_NS
               fi
 
+              if [ "$ENABLE_IPV6_NAT" = "true" ]; then
+                echo "==> 可选 IPv6 NAT（可能出现 VINTF 提示）"
+                enable_opt IP6_NF_NAT
+                enable_opt IP6_NF_TARGET_MASQUERADE
+              fi
+
               make O=out olddefconfig
 
               echo "==> 断言：必须为 y 的选项"
@@ -309,7 +322,7 @@ jobs:
 
               echo "==> 配置变化（原厂 -> 最终）"
               {
-                for o in $REQUIRED $OPTIONAL_NET USER_NS; do
+                for o in $REQUIRED $OPTIONAL_NET USER_NS IP6_NF_NAT IP6_NF_TARGET_MASQUERADE; do
                   b=$(grep -E "^(# )?CONFIG_${o}(=| is not set)" out/.config.stock | head -n1 || true)
                   a=$(grep -E "^(# )?CONFIG_${o}(=| is not set)" out/.config | head -n1 || true)
                   [ -z "$b" ] && b="(absent)"
@@ -373,6 +386,7 @@ jobs:
             echo "config source: $(cat build-config/source.txt)"
             echo "optional net:  ${{ inputs.optional_network }}"
             echo "user ns:       ${{ inputs.enable_user_ns }}"
+            echo "ipv6 nat:      ${{ inputs.enable_ipv6_nat }}"
             echo "stock boot:    ${STOCK_BOOT_URL}"
             echo "stock sha256:  ${STOCK_BOOT_SHA256}"
             echo "ddk image:     ${DDK_IMAGE}"
