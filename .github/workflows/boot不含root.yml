@@ -61,34 +61,35 @@ jobs:
           echo "正在全自动清理缺失的闭源驱动引用..."
           echo "========================================="
           
-          # 清理 drivers/base/Kconfig
-          if [ -f drivers/base/Kconfig ]; then
-            grep -oP '(?<=source ").*(?=")' drivers/base/Kconfig | while read -r path; do
-              if [ ! -f "$path" ] && [[ "$path" == drivers/base/* ]]; then
-                echo "  -> 发现缺失路径: $path，正在自动移除引用..."
+          # 1. 修复 Kconfig 缺失引用 (全自动扫描)
+          find drivers -name "Kconfig" | while read -r kfile; do
+            dir_prefix=$(dirname "$kfile")
+            grep -oP '(?<=source ").*(?=")' "$kfile" | while read -r path; do
+              if [[ "$path" == drivers/* ]] || [[ "$path" == /* ]]; then
+                full_path="$path"
+              else
+                full_path="$dir_prefix/$path"
+              fi
+              
+              if [ ! -f "$full_path" ] && [ ! -d "$full_path" ]; then
+                echo "  -> [Kconfig] 发现缺失路径: $path，正在从 $kfile 移除引用..."
                 escaped_path=$(echo "$path" | sed 's/[]\/$*.^[]/\\&/g')
-                sed -i "/source \"$escaped_path\"/d" drivers/base/Kconfig
+                sed -i "/source \"$escaped_path\"/d" "$kfile"
               fi
             done
-          fi
+          done
 
-          # 清理 drivers/base/Makefile
-          if [ -f drivers/base/Makefile ]; then
-            grep -oP '(?<=obj-[ym] \+= )[\w\-]+(?=/)' drivers/base/Makefile | sort -u | while read -r dir; do
-              if [ ! -d "drivers/base/$dir" ]; then
-                echo "  -> 发现缺失目录: $dir，正在从 Makefile 移除..."
-                sed -i "/obj-[ym] += $dir\//d" drivers/base/Makefile
+          # 2. 修复 Makefile 缺失目录引用 (全自动扫描)
+          find drivers -name "Makefile" | while read -r mfile; do
+            dir_prefix=$(dirname "$mfile")
+            grep -oP '(?<=obj-[ym] \+= )[\w\-]+(?=/)' "$mfile" | sort -u | while read -r dir; do
+              if [ ! -d "$dir_prefix/$dir" ]; then
+                echo "  -> [Makefile] 发现缺失目录: $dir_prefix/$dir，正在从 $mfile 移除..."
+                escaped_dir=$(echo "$dir" | sed 's/[]\/$*.^[]/\\&/g')
+                sed -i "/obj-[ym] += $escaped_dir\//d" "$mfile"
               fi
             done
-          fi
-          
-          # 【新增】清理 drivers/misc/Kconfig 中的 haptic_feedback 引用
-          if [ -f drivers/misc/Kconfig ]; then
-            if grep -q "drivers/misc/vibrator/haptic_feedback/Kconfig" drivers/misc/Kconfig; then
-              echo "  -> 发现缺失路径: drivers/misc/vibrator/haptic_feedback/Kconfig，正在自动移除引用..."
-              sed -i '/source "drivers\/misc\/vibrator\/haptic_feedback\/Kconfig"/d' drivers/misc/Kconfig
-            fi
-          fi
+          done
           
           cd ..
 
@@ -141,22 +142,17 @@ jobs:
       - name: 下载 magiskboot 工具（仅用于解包/重打包 boot.img，与 Root 无关）
         run: |
           cd kernel_workspace
-          echo "正在获取 Magisk 最新 Release 信息..."
-          MAGISK_API=$(curl -fsSL https://api.github.com/repos/topjohnwu/Magisk/releases/latest)
-          MAGISK_APK_URL=$(echo "$MAGISK_API" | jq -r '.assets[] | select(.name | endswith(".apk") and (contains("debug") | not)) | .browser_download_url' | head -n 1)
-
-          if [ -z "$MAGISK_APK_URL" ] || [ "$MAGISK_APK_URL" == "null" ]; then
-            echo "::error::无法获取 Magisk APK 下载链接"
-            exit 1
-          fi
-
+          
+          # 直接使用固定链接，规避 GitHub API 403 限制
+          MAGISK_APK_URL="https://github.com/topjohnwu/Magisk/releases/latest/download/app-release.apk"
           MAGISK_APK_FILE="magisk.apk"
+          
           echo "正在下载 Magisk APK: $MAGISK_APK_URL"
           curl -fL -o "$MAGISK_APK_FILE" "$MAGISK_APK_URL"
 
           echo "正在从 Magisk APK 中提取 magiskboot..."
           if ! unzip -j "$MAGISK_APK_FILE" "lib/x86_64/libmagiskboot.so" -d . 2>/dev/null; then
-            echo "::warning::标准路径不存在，列出 APK 内 magiskboot 相关文件："
+            echo "::error::标准路径不存在，列出 APK 内 magiskboot 相关文件："
             unzip -l "$MAGISK_APK_FILE" | grep -i magiskboot || true
             echo "::error::无法从 Magisk APK 中提取 magiskboot"
             exit 1
@@ -359,10 +355,10 @@ jobs:
             fi
           fi
 
-          # 3.4 文件大小检查
+          # 3.4 文件大小检查 (修复了emoji乱码)
           ORIG_SIZE=$(stat -c%s ../stock_boot.img)
           NEW_SIZE=$(stat -c%s ../new-boot.img)
-          echo "  [] 原厂 boot.img: $ORIG_SIZE bytes"
+          echo "  [ℹ] 原厂 boot.img: $ORIG_SIZE bytes"
           echo "  [ℹ] 新 boot.img:   $NEW_SIZE bytes"
 
           if [ "$NEW_SIZE" -lt 10000000 ]; then
