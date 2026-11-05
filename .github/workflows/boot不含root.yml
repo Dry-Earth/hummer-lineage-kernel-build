@@ -56,39 +56,26 @@ jobs:
           cd common
           git submodule update --init --recursive --depth=1
           
-          # 【核心防御】全自动清理缺失的闭源驱动 Kconfig/Makefile 引用 (终极排雷版)
+          # ===== 【最暴力的排雷法：缺什么文件夹，我们就建什么空文件夹！】 =====
           echo "========================================="
-          echo "正在全自动清理缺失的闭源驱动引用..."
+          echo "正在暴力补齐缺失的源码目录（空壳战术）..."
           echo "========================================="
           
-          # 1. 修复 Kconfig 缺失引用
-          find drivers -name "Kconfig" | while read -r kfile; do
-            dir_prefix=$(dirname "$kfile")
-            grep -oP '(?<=source ").*(?=")' "$kfile" | while read -r path; do
-              if [[ "$path" == drivers/* ]] || [[ "$path" == /* ]]; then
-                full_path="$path"
-              else
-                full_path="$dir_prefix/$path"
-              fi
-              
-              if [ ! -f "$full_path" ] && [ ! -d "$full_path" ]; then
-                echo "  -> [Kconfig] 发现缺失路径: $path，正在从 $kfile 移除引用..."
-                escaped_path=$(echo "$path" | sed 's/[]\/$*.^[]/\\&/g')
-                sed -i "/source \"$escaped_path\"/d" "$kfile"
-              fi
-            done
-          done
-
-          # 2. 修复 Makefile 缺失目录引用 (终极排雷版，干掉 soc/oplus/boot)
-          find drivers -name "Makefile" | while read -r mfile; do
-            dir_prefix=$(dirname "$mfile")
-            grep -oP '(?<=\+= )[\w\-]+(?=/)' "$mfile" | sort -u | while read -r dir; do
-              if [ -n "$dir" ] && [ ! -d "$dir_prefix/$dir" ]; then
-                echo "  -> [Makefile] 发现缺失目录: $dir_prefix/$dir，正在从 $mfile 移除引用..."
-                sed -i "/+=.*\b$dir\//d" "$mfile"
-              fi
-            done
-          done
+          # 针对一加闭源缺失的 soc/oplus/boot
+          mkdir -p drivers/soc/oplus/boot
+          touch drivers/soc/oplus/boot/Makefile
+          touch drivers/soc/oplus/boot/Kconfig
+          
+          # 针对之前报错的其他缺失目录（防患于未然）
+          mkdir -p drivers/misc/vibrator/haptic_feedback
+          touch drivers/misc/vibrator/haptic_feedback/Makefile
+          touch drivers/misc/vibrator/haptic_feedback/Kconfig
+          
+          mkdir -p drivers/power/oplus
+          touch drivers/power/oplus/Makefile
+          touch drivers/power/oplus/Kconfig
+          
+          echo "✅ 假目录补齐完毕！编译器进去了只会发现是个空房间，不会报错了！"
           
           cd ..
 
