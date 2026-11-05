@@ -318,7 +318,8 @@ jobs:
                 done
               } | tee out/config.report.txt
               diff -u out/.config.stock out/.config > out/config.diff || true
-              echo "changed config lines: $(grep -cE '^[+-]CONFIG_|^[+-]# CONFIG_' out/config.diff || true)"
+              changed=$(grep -cE "^[+-]CONFIG_|^[+-]# CONFIG_" out/config.diff || true)
+              echo "changed config lines: $changed"
 
               echo "==> building Image"
               ccache_arg=()
