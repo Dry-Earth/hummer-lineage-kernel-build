@@ -212,24 +212,29 @@ CFS_BANDWIDTH CGROUP_PIDS NF_TABLES NET_L3_MASTER_DEV
 这两条会让“原厂模块仍然安全加载”的保证失效，所以**没有采用**。目前只按
 Droidspaces 官方 GKI 列表开启 kABI 安全的选项。
 
-### v2 构建结果
+### v2 构建结果（推荐）
 
-- run：https://github.com/Dry-Earth/hummer-lineage-kernel-build/actions/runs/42071469405
-- Release：https://github.com/Dry-Earth/hummer-lineage-kernel-build/releases/tag/boot-42071469405
-- 直链：https://github.com/Dry-Earth/hummer-lineage-kernel-build/releases/download/boot-42071469405/new-boot.img
-- sha256：`5f1b83589098b4df6f40714fba52de1e0acd4afd252cdcdd079f588a8034464b`
+- run：https://github.com/Dry-Earth/hummer-lineage-kernel-build/actions/runs/42075428894
+- Release：https://github.com/Dry-Earth/hummer-lineage-kernel-build/releases/tag/boot-42075428894
+- 直链：https://github.com/Dry-Earth/hummer-lineage-kernel-build/releases/download/boot-42075428894/new-boot.img
+- sha256：`a81c4d9c890e9610162463cfe46a7cf7493b49c8366b57f48ead9d58b2514fbd`
 
 这次日志确认：
 
 ```
 配置基线: stock_boot（直接从官方 boot.img 提取）
-changed config lines: 68
+changed config lines: 64
 [ok] SYSVIPC / POSIX_MQUEUE / IPC_NS / PID_NS / DEVTMPFS / NETFILTER_XT_MATCH_ADDRTYPE
 [ok] CFS_BANDWIDTH / CGROUP_PIDS / NF_TABLES / NET_L3_MASTER_DEV 未开启
+IP6_NF_NAT: 保持 not set（默认关闭）
 ccache version 4.10.2
 ```
 
-第一次构建没有 ccache 命中，耗时约 21 分钟；之后 key 不变时会明显更快。
+第一次构建（无 ccache）约 21 分钟；第二次复用 ccache 约 12 分钟。
+
+带 IPv6 NAT 的测试版也保留着（`boot-42071469405`，sha256
+`5f1b8358...`），需要 NAT66 时可以用它，或重新跑 v2 并把
+`enable_ipv6_nat` 设为 true。
 
 ### 关于编译器
 
