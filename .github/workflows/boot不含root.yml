@@ -63,7 +63,6 @@ jobs:
           # 1. 极限防守清理 Makefile 缺失引用
           find drivers -name "Makefile" | while read -r mfile; do
             dir_prefix=$(dirname "$mfile")
-            # 提取 += 后面的完整路径（支持多级）
             grep -oP '(?<=\+= )[\w\-/]+' "$mfile" | sort -u | while read -r path; do
               clean_path="${path%/}"
               [ -z "$clean_path" ] && continue
@@ -138,16 +137,20 @@ jobs:
           restore-keys: |
             ${{ env.CCACHE_REAL_KEY }}-${{ runner.os }}-
 
-      - name: 准备 magiskboot
+      - name: 准备 magiskboot (官方 APK 解压版)
         run: |
           cd kernel_workspace
-          # 依然使用备用二进制源，因为 Magisk 官方 APK 的结构变动会导致解压失败
-          wget -q https://github.com/1xyz/magiskboot_binary/raw/main/magiskboot
-          if [ ! -f magiskboot ]; then
-            echo "::error::magiskboot 下载失败！"
-            exit 1
-          fi
+          echo "正在下载官方 Magisk APK..."
+          # 使用固定版本的官方链接，这绝对不可能 404
+          curl -fL -o magisk.apk "https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk"
+          
+          echo "正在从 APK 中提取 magiskboot..."
+          # 忽略错误强行解压，因为不同版本 APK 内部路径可能有变
+          unzip -o -j magisk.apk "lib/x86_64/libmagiskboot.so" -d . || unzip -o -j magisk.apk "*libmagiskboot.so*" -d .
+          
+          mv libmagiskboot.so magiskboot
           chmod +x magiskboot
+          rm -f magisk.apk
           echo "✅ magiskboot 就绪"
 
       - name: 应用 Droidspaces kABI 补丁 (网络下载版)
@@ -155,10 +158,10 @@ jobs:
           cd kernel_workspace/common
           echo "正在从 cctv18 备份仓库下载 kABI 补丁..."
           
-          # 使用极其稳定的备份源
+          # 使用极其稳定的备份源，并加入 retry 机制
           PATCH_URL="https://raw.githubusercontent.com/cctv18/oppo_oplus_realme_sm8750/main/droidspaces_patch/fix_sysvipc_kabi_6_7_8.patch"
           
-          if ! curl -fsSL -o fix_sysvipc_kabi.patch "$PATCH_URL"; then
+          if ! curl -fsSL --retry 3 --retry-delay 5 -o fix_sysvipc_kabi.patch "$PATCH_URL"; then
             echo "::error::补丁下载失败，可能是网络问题！"
             exit 1
           fi
