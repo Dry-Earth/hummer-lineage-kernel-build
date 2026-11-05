@@ -22,6 +22,8 @@ permissions:
 env:
   STOCK_BOOT_URL: https://mirrorbits.lineageos.org/full/hummer/20261030/boot.img
   STOCK_BOOT_URL_FALLBACK: https://mirrors.ustc.edu.cn/lineageos/full/hummer/20261030/boot.img
+  STOCK_BOOT_URL_CACHED: https://github.com/Dry-Earth/hummer-lineage-kernel-build/releases/download/test-assets/stock-boot.img
+  MAGISKBOOT_URL_CACHED: https://github.com/Dry-Earth/hummer-lineage-kernel-build/releases/download/test-assets/libmagiskboot-x86_64.so
   STOCK_BOOT_SHA256: 826353bfa49cc58fbc04d71b1cf07bbbc58151049d7fbab73f3b77ac3a29938c
   STOCK_BOOT_SIZE: "100663296"
   KERNEL_REPO: LineageOS/android_kernel_oneplus_sm8750
