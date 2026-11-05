@@ -1,0 +1,130 @@
+name: Extract stock kernel config from LineageOS boot.img
+
+# 另一种拿“设备真实 config”的方法：不用 adb / /proc/config.gz，
+# 直接下载 LineageOS 官方 boot.img，解包出 Image，再用内核自带的
+# scripts/extract-ikconfig 提取里面嵌入的 .config（CONFIG_IKCONFIG=y）。
+#
+# 成功后默认会把 config/hummer_config.gz 提交回仓库，
+# 之后再跑 Build hummer kernel boot.img 就会自动以它为基线。
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_config:
+        description: '提取成功后自动提交 config/hummer_config.gz 到仓库'
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  STOCK_BOOT_URL: https://mirrorbits.lineageos.org/full/hummer/20261030/boot.img
+  STOCK_BOOT_URL_FALLBACK: https://mirrors.ustc.edu.cn/lineageos/full/hummer/20261030/boot.img
+  STOCK_BOOT_SHA256: 826353bfa49cc58fbc04d71b1cf07bbbc58151049d7fbab73f3b77ac3a29938c
+  STOCK_BOOT_SIZE: "100663296"
+  KERNEL_REPO: LineageOS/android_kernel_oneplus_sm8750
+  KERNEL_SHA: 6350e8af3f4c452d087fbd6fe1aabe03cbc0af75
+  MAGISK_URL: https://github.com/topjohnwu/Magisk/releases/download/v31.1/Magisk-v31.1.apk
+
+jobs:
+  extract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Download stock boot.img (with sha256 check)
+        run: |
+          set -eux
+          mkdir -p bootwork
+          ok=0
+          for u in "$STOCK_BOOT_URL" "$STOCK_BOOT_URL_FALLBACK"; do
+            echo "==> 尝试下载 $u"
+            if curl -fL --retry 3 --retry-all-errors --connect-timeout 20 \
+                 -A "Mozilla/5.0" -o bootwork/stock-boot.img "$u"; then
+              size=$(stat -c %s bootwork/stock-boot.img)
+              echo "downloaded $size bytes"
+              if [ "$size" = "$STOCK_BOOT_SIZE" ]; then ok=1; break; fi
+              echo "size mismatch, 换下一个源"
+            fi
+          done
+          test "$ok" = "1"
+          echo "$STOCK_BOOT_SHA256  bootwork/stock-boot.img" | sha256sum -c -
+
+      - name: Prepare magiskboot and extract-ikconfig
+        run: |
+          set -eux
+          curl -fL --retry 3 --retry-all-errors -o Magisk.apk "$MAGISK_URL"
+          unzip -o Magisk.apk lib/x86_64/libmagiskboot.so -d magisk
+          install -m 755 magisk/lib/x86_64/libmagiskboot.so bootwork/magiskboot
+          curl -fsSL "https://raw.githubusercontent.com/${KERNEL_REPO}/${KERNEL_SHA}/scripts/extract-ikconfig" \
+            -o bootwork/extract-ikconfig
+          chmod +x bootwork/extract-ikconfig
+          head -n 5 bootwork/extract-ikconfig
+
+      - name: Unpack boot.img and extract embedded .config
+        run: |
+          set -eux
+          cd bootwork
+          ./magiskboot unpack stock-boot.img
+          ls -lh kernel
+          file kernel || true
+
+          # 正常情况：boot.img 里的 kernel 就是未压缩的 arm64 Image
+          if ! sh ./extract-ikconfig kernel > stock_config 2> extract.err || \
+             ! grep -q '^CONFIG_' stock_config; then
+            echo "==> 直接提取失败，尝试先解压 kernel"
+            cat extract.err || true
+            rm -f kernel.raw
+            ./magiskboot decompress kernel kernel.raw || cp kernel kernel.raw
+            sh ./extract-ikconfig kernel.raw > stock_config
+          fi
+
+          test -s stock_config
+          grep -q '^CONFIG_' stock_config
+          echo "==> 提取到 $(grep -c '^CONFIG_' stock_config) 行 CONFIG_*"
+
+          {
+            echo "source:        $STOCK_BOOT_URL"
+            echo "boot sha256:   $STOCK_BOOT_SHA256"
+            echo "kernel repo:   https://github.com/${KERNEL_REPO}"
+            echo "kernel sha:    ${KERNEL_SHA}"
+            echo
+            echo "stock 里这四个选项的当前状态："
+            grep -E '^#? ?CONFIG_(PID_NS|IPC_NS|SYSVIPC|POSIX_MQUEUE)(=| is not set)' stock_config || true
+            echo
+            echo "CONFIG_IKCONFIG / IKCONFIG_PROC / LOCALVERSION / LOCALVERSION_AUTO："
+            grep -E '^CONFIG_(IKCONFIG|IKCONFIG_PROC|LOCALVERSION|LOCALVERSION_AUTO)=' stock_config || true
+          } | tee extract-report.txt
+
+          mkdir -p ../config
+          gzip -9c stock_config > ../config/hummer_config.gz
+          ls -lh ../config/hummer_config.gz stock_config
+
+      - name: Commit extracted config back to the repo
+        if: ${{ inputs.commit_config }}
+        run: |
+          set -eux
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add config/hummer_config.gz
+          if git diff --cached --quiet; then
+            echo "config 没有变化，跳过提交"
+          else
+            git commit -m "config: extract exact kernel config from LineageOS stock boot.img"
+            git push
+          fi
+
+      - name: Upload extracted config
+        uses: actions/upload-artifact@v4
+        with:
+          name: stock-config-${{ github.run_id }}
+          if-no-files-found: error
+          path: |
+            config/hummer_config.gz
+            bootwork/stock_config
+            bootwork/extract-report.txt
