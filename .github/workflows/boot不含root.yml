@@ -61,7 +61,7 @@ jobs:
           echo "正在全自动清理缺失的闭源驱动引用..."
           echo "========================================="
           
-          # 1. 修复 Kconfig 缺失引用 (全自动扫描)
+          # 1. 修复 Kconfig 缺失引用
           find drivers -name "Kconfig" | while read -r kfile; do
             dir_prefix=$(dirname "$kfile")
             grep -oP '(?<=source ").*(?=")' "$kfile" | while read -r path; do
@@ -79,30 +79,22 @@ jobs:
             done
           done
 
-          # 2. 修复 Makefile 缺失目录引用 (全自动扫描，干掉所有找不到的文件夹)
+          # 2. 修复 Makefile 缺失目录引用
           find drivers -name "Makefile" | while read -r mfile; do
             dir_prefix=$(dirname "$mfile")
-            # 提取 += 后面的所有目录名，不管是 obj-y 还是 obj-$(CONFIG_XXX)
             grep -oP '(?<=\+= )[\w\-]+(?=/)' "$mfile" | sort -u | while read -r dir; do
               if [ -n "$dir" ] && [ ! -d "$dir_prefix/$dir" ]; then
                 echo "  -> [Makefile] 发现缺失目录: $dir_prefix/$dir，正在从 $mfile 移除引用..."
-                # 只要这一行包含了这个缺失的目录，就把这一整行删掉
                 sed -i "/+=.*\b$dir\//d" "$mfile"
               fi
             done
           done
           
-          # 3. 针对 soc/oplus/boot 的终极点杀（防止上面的正则漏网）
+          # 3. 针对 soc/oplus/boot 的终极点杀
           if [ -f drivers/soc/oplus/Makefile ]; then
             if grep -q "boot" drivers/soc/oplus/Makefile; then
               echo "  -> [终极点杀] 强行从 drivers/soc/oplus/Makefile 移除 boot 引用..."
               sed -i '/boot/d' drivers/soc/oplus/Makefile
-            fi
-          fi
-          if [ -f drivers/soc/oplus/Kconfig ]; then
-            if grep -q "boot" drivers/soc/oplus/Kconfig; then
-              echo "  -> [终极点杀] 强行从 drivers/soc/oplus/Kconfig 移除 boot 引用..."
-              sed -i '/boot/d' drivers/soc/oplus/Kconfig
             fi
           fi
           
@@ -176,24 +168,65 @@ jobs:
           rm -f "$MAGISK_APK_FILE"
           echo "✅ magiskboot 就绪"
 
-      - name: 应用 Droidspaces kABI 补丁
+      - name: 应用 Droidspaces kABI 补丁 (多重容错下载版)
         run: |
           cd kernel_workspace/common
-          echo "正在应用 Droidspaces GKI kABI 补丁..."
-          curl -fLo fix_sysvipc_kabi_6_7_8.patch https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-kernel-6.12-fix_sysvipc_kabi_6_7_8.patch
+          echo "正在准备下载 kABI 补丁 (已开启多重镜像容错)..."
+          
+          # 准备三个下载链接：JSdelivr CDN加速、官方原链接、cctv18大佬的备份链接
+          URL_CDN="https://cdn.jsdelivr.net/gh/ravindu644/Droidspaces-OSS@main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch"
+          URL_RAW="https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch"
+          URL_BACKUP="https://raw.githubusercontent.com/cctv18/oppo_oplus_realme_sm8750/main/droidspaces_patch/fix_sysvipc_kabi_6_7_8.patch"
 
-          if patch -p1 -F 3 --dry-run < fix_sysvipc_kabi_6_7_8.patch > /dev/null 2>&1; then
-            patch -p1 -F 3 < fix_sysvipc_kabi_6_7_8.patch
+          PATCH_FILE="fix_sysvipc_kabi_6_7_8.patch"
+          DOWNLOAD_SUCCESS=false
+
+          # 1. 尝试 CDN 加速下载
+          echo "尝试从 CDN 下载..."
+          if curl -fsSL -o "$PATCH_FILE" "$URL_CDN"; then
+            DOWNLOAD_SUCCESS=true
+            echo "✅ CDN 下载成功！"
+          else
+            echo "::warning::CDN 下载失败，尝试官方源..."
+            # 2. 尝试官方源
+            if curl -fsSL -o "$PATCH_FILE" "$URL_RAW"; then
+              DOWNLOAD_SUCCESS=true
+              echo "✅ 官方源下载成功！"
+            else
+              echo "::warning::官方源下载失败，尝试备份源..."
+              # 3. 尝试备份源
+              if curl -fsSL -o "$PATCH_FILE" "$URL_BACKUP"; then
+                DOWNLOAD_SUCCESS=true
+                echo "✅ 备份源下载成功！"
+              fi
+            fi
+          fi
+
+          if [ "$DOWNLOAD_SUCCESS" = false ]; then
+            echo "::error::所有下载链接均失败，无法获取 kABI 补丁！"
+            exit 1
+          fi
+
+          # 验证补丁文件是否有效（是不是空文件或报错页面）
+          if [ ! -s "$PATCH_FILE" ] || ! grep -q "struct sysv_sem" "$PATCH_FILE"; then
+            echo "::error::下载的补丁文件内容无效！"
+            exit 1
+          fi
+
+          echo "正在应用补丁..."
+          if patch -p1 -F 3 --dry-run < "$PATCH_FILE" > /dev/null 2>&1; then
+            patch -p1 -F 3 < "$PATCH_FILE"
             echo "✅ kABI 补丁干净应用"
           else
             echo "::warning::kABI 补丁无法干净应用，尝试 fuzz 应用..."
-            if patch -p1 -F 3 < fix_sysvipc_kabi_6_7_8.patch; then
+            if patch -p1 -F 3 < "$PATCH_FILE"; then
               echo "✅ kABI 补丁（fuzz）应用成功"
             else
-              echo "::warning::kABI 补丁应用失败。"
+              echo "::error::kABI 补丁应用失败！"
+              exit 1
             fi
           fi
-          rm -f fix_sysvipc_kabi_6_7_8.patch
+          rm -f "$PATCH_FILE"
 
       - name: 提取原厂配置并注入验证过的容器支持
         run: |
@@ -216,7 +249,7 @@ jobs:
           fi
           echo "✅ 解包成功"
 
-          # ===== 2. 提取 LineageOS 24 原厂 .config (自适应核心) =====
+          # ===== 2. 提取 LineageOS 24 原厂 .config =====
           echo "正在用 extract-ikconfig 提取 LineageOS 24 原厂配置..."
           cd common
           mkdir -p out
@@ -232,7 +265,7 @@ jobs:
             exit 1
           fi
 
-          # ===== 3. 注入实战验证过的 Droidspaces 配置 (去除了无源码的 NTSYNC) =====
+          # ===== 3. 注入 Droidspaces 配置 (去除了无源码的 NTSYNC) =====
           echo "正在执行微创手术：注入容器配置..."
           
           ./common/scripts/config --file ./common/out/.config \
@@ -247,20 +280,19 @@ jobs:
             --enable IKCONFIG \
             --enable IKCONFIG_PROC
 
-          # 网络匹配增强
           ./common/scripts/config --file ./common/out/.config \
             --enable NETFILTER_XT_MATCH_ADDRTYPE \
             --enable NETFILTER_XT_TARGET_LOG \
             --enable NETFILTER_XT_MATCH_RECENT
 
-          # ===== 4. olddefconfig 解决依赖 =====
+          # ===== 4. olddefconfig =====
           echo "正在执行 olddefconfig 解决依赖冲突..."
           cd common
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             CC="ccache clang" LD="ld.lld" HOSTLD=ld.lld O=out olddefconfig
           cd ..
 
-          # ===== 5. 断言检查 (去除了 NTSYNC) =====
+          # ===== 5. 断言检查 =====
           echo "正在执行断言检查..."
           ASSERT_PASS=true
           for CONFIG in CONFIG_PID_NS CONFIG_IPC_NS CONFIG_USER_NS CONFIG_SYSVIPC CONFIG_DEVTMPFS CONFIG_NAMESPACES CONFIG_POSIX_MQUEUE CONFIG_NETFILTER_XT_MATCH_ADDRTYPE; do
