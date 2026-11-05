@@ -23,18 +23,22 @@
 | 官方 boot.img | `mirrorbits.lineageos.org/full/hummer/20261030/boot.img` |
 | 官方 boot sha256 | `826353bfa49cc58fbc04d71b1cf07bbbc58151049d7fbab73f3b77ac3a29938c` |
 | 编译容器 | `ghcr.io/ylarod/ddk-min:android15-6.6-20260313`（clang r510928） |
-| 成功 run | https://github.com/Dry-Earth/hummer-lineage-kernel-build/actions/runs/42054473850 |
+| 配置基线 | 从官方 boot.img 提取的真实 `.config`（`config/hummer_config.gz`） |
+| 成功 run | https://github.com/Dry-Earth/hummer-lineage-kernel-build/actions/runs/42061358728 |
 
 **下载（Release 直链，不需要登录 Actions）：**
 
-- 编译后的 boot：https://github.com/Dry-Earth/hummer-lineage-kernel-build/releases/download/boot-42054473850/new-boot.img
-- 官方原版 boot（回滚用）：https://github.com/Dry-Earth/hummer-lineage-kernel-build/releases/download/boot-42054473850/stock-boot.img
-- Release 页面：https://github.com/Dry-Earth/hummer-lineage-kernel-build/releases/tag/boot-42054473850
+- 编译后的 boot（推荐，真实原厂 config 基线）：https://github.com/Dry-Earth/hummer-lineage-kernel-build/releases/download/boot-42061358728/new-boot.img
+- 官方原版 boot（回滚用）：https://github.com/Dry-Earth/hummer-lineage-kernel-build/releases/download/boot-42061358728/stock-boot.img
+- Release 页面：https://github.com/Dry-Earth/hummer-lineage-kernel-build/releases/tag/boot-42061358728
 
 | 文件 | 大小 | sha256 |
 |---|---|---|
-| `new-boot.img` | 100663296 | `e37a88fa74846764b414bd08922702d3462312c56c4d755803b58f5ba4e63ae7` |
+| `new-boot.img` | 100663296 | `7f602e2165f4039ca4eed79f7201bf061fd2fe2dec14c8fd44fd89141c2dd8c0` |
 | `stock-boot.img` | 100663296 | `826353bfa49cc58fbc04d71b1cf07bbbc58151049d7fbab73f3b77ac3a29938c` |
+
+第一次构建（合并配置基线）的产物也保留着：
+https://github.com/Dry-Earth/hummer-lineage-kernel-build/releases/tag/boot-42054473850
 
 构建日志已确认：
 
@@ -50,9 +54,11 @@ Linux version 6.6.144-4k-g6350e8af3f4c
 
 ```
 .github/workflows/build-hummer-boot.yml   # 云端编译流程
-.github/workflows/publish-boot.yml        # 把已有构建产物发成 Release（不重编）
-patches/0001-sysvipc-kabi.patch           # Droidspaces 官方 kABI padding 补丁
-config/README.md                          # 可选的 /proc/config.gz 说明
+.github/workflows/extract-stock-config.yml # 从官方 boot.img 提取真实 config（无需设备）
+.github/workflows/publish-boot.yml         # 把已有构建产物发成 Release（不重编）
+patches/0001-sysvipc-kabi.patch            # Droidspaces 官方 kABI padding 补丁
+config/hummer_config.gz                    # 从官方 boot.img 提取的真实内核配置
+config/README.md                           # 配置说明
 ```
 
 ## 关键点
@@ -100,8 +106,8 @@ make[6]: *** No rule to make target '../drivers/soc/oplus/boot/Makefile'
 
 优先级：
 
-1. `config/hummer_config.gz`（设备 `/proc/config.gz`，最稳）——本仓库目前**没有**放
-2. 按 LineageOS `TARGET_KERNEL_CONFIG` 顺序合并（当前使用）：
+1. `config/hummer_config.gz`（当前已通过“从原厂 boot.img 提取”生成并提交）——**推荐，当前使用**
+2. 按 LineageOS `TARGET_KERNEL_CONFIG` 顺序合并：
    ```
    gki_defconfig
    + vendor/sun_perf.config
@@ -109,14 +115,40 @@ make[6]: *** No rule to make target '../drivers/soc/oplus/boot/Makefile'
    ```
    然后只改上面 4 个选项。
 
-如果想以后做到 100% 对齐设备当前 config，可以：
+#### 方法 A：从设备拉 `/proc/config.gz`
 
 ```bash
 adb shell su -c "cp /proc/config.gz /sdcard/hummer_config.gz"
 adb pull /sdcard/hummer_config.gz hummer-kernel-ci/config/hummer_config.gz
 ```
 
-把文件提交到仓库，下次构建会自动优先使用它。
+#### 方法 B：直接从 LineageOS 原厂 boot.img 提取（已实现，无需设备）
+
+Actions → **Extract stock kernel config from LineageOS boot.img** → Run workflow。
+
+它做的事情：
+
+1. 下载官方 `boot.img` 并校验 sha256（`826353b...`）
+2. 用 magiskboot 解包，取出里面的 `Image`
+3. 用内核自带的 `scripts/extract-ikconfig` 提取内嵌的 `.config`
+   （原厂内核 `CONFIG_IKCONFIG=y` / `IKCONFIG_PROC=y`，所以一定带配置）
+4. 压缩成 `config/hummer_config.gz`，**自动提交回仓库**
+5. 之后再跑 **Build hummer kernel boot.img**，就会自动以它为基线
+
+本次已提取成功：2683 个 `CONFIG_*`，原厂 boot 里四个目标选项均为 `not set`，
+与预期一致。
+
+#### 仓库内缓存的原厂资源
+
+为了避免 mirrorbits / USTC 对 runner IP 返回 403，官方 `boot.img` 和
+`magiskboot` 也缓存到了 Release（内容与官方完全一致，已用 sha256 校验）：
+
+- https://github.com/Dry-Earth/hummer-lineage-kernel-build/releases/download/test-assets/stock-boot.img
+  （sha256 `826353bfa49cc58fbc04d71b1cf07bbbc58151049d7fbab73f3b77ac3a29938c`）
+- https://github.com/Dry-Earth/hummer-lineage-kernel-build/releases/download/test-assets/libmagiskboot-x86_64.so
+  （来自 Magisk v31.1）
+
+workflow 会**优先**用仓库缓存，失败后再回退到 `mirrorbits` → USTC 官方镜像。
 
 ## 刷机
 
