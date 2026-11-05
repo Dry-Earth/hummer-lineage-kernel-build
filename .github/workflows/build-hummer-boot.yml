@@ -15,6 +15,11 @@ env:
   KERNEL_REPO: LineageOS/android_kernel_oneplus_sm8750
   KERNEL_BRANCH: lineage-24.0
   KERNEL_SHA: 6350e8af3f4c452d087fbd6fe1aabe03cbc0af75
+  # kernel 里 drivers/soc/oplus/*、drivers/base/kernelFwUpdate 等是符号链接，
+  # 指向 ../../../../sm8750-modules/...，所以必须把 modules 仓库检出到 kernel 的同级目录。
+  MODULES_REPO: LineageOS/android_kernel_oneplus_sm8750-modules
+  MODULES_BRANCH: lineage-24.0
+  MODULES_SHA: e05c031ce1512477f2d5db7bfa26a859adfcfbc7
   EXPECTED_RELEASE: 6.6.144-4k-g6350e8af3f4c
   STOCK_BOOT_URL: https://mirrors.ustc.edu.cn/lineageos/full/hummer/20261030/boot.img
   DDK_IMAGE: ghcr.io/ylarod/ddk-min:android15-6.6-20260313
@@ -43,12 +48,54 @@ jobs:
       - name: Clone kernel source at the exact SHA
         run: |
           set -eux
-          git clone --depth 1 --no-tags --branch "$KERNEL_BRANCH" \
-            "https://github.com/${KERNEL_REPO}.git" kernel
+          mkdir -p kernel
           cd kernel
+          git init -q
+          git remote add origin "https://github.com/${KERNEL_REPO}.git"
+          if ! git fetch --depth 1 --no-tags origin "$KERNEL_SHA"; then
+            echo "::warning::fetch by SHA failed, falling back to a deeper branch fetch"
+            git fetch --no-tags --depth 200 origin "$KERNEL_BRANCH"
+          fi
+          git checkout -q "$KERNEL_SHA" 2>/dev/null || git checkout -q FETCH_HEAD
           actual=$(git rev-parse HEAD)
-          echo "HEAD=$actual"
+          echo "kernel HEAD=$actual"
           test "$actual" = "$KERNEL_SHA"
+
+      - name: Clone modules source (sibling of kernel) at the exact SHA
+        run: |
+          set -eux
+          mkdir -p sm8750-modules
+          cd sm8750-modules
+          git init -q
+          git remote add origin "https://github.com/${MODULES_REPO}.git"
+          if ! git fetch --depth 1 --no-tags origin "$MODULES_SHA"; then
+            echo "::warning::fetch by SHA failed, falling back to a deeper branch fetch"
+            git fetch --no-tags --depth 200 origin "$MODULES_BRANCH"
+          fi
+          git checkout -q "$MODULES_SHA" 2>/dev/null || git checkout -q FETCH_HEAD
+          actual=$(git rev-parse HEAD)
+          echo "modules HEAD=$actual"
+          test "$actual" = "$MODULES_SHA"
+
+      - name: Check for broken symlinks in kernel tree
+        run: |
+          set -eu
+          broken=0
+          while IFS= read -r link; do
+            target=$(readlink "$link")
+            case "$target" in
+              /*) resolved="$target" ;;
+              *)  resolved="$(dirname "$link")/$target" ;;
+            esac
+            if [ ! -e "$resolved" ]; then
+              echo "BROKEN: $link -> $target"
+              broken=$((broken + 1))
+            fi
+          done < <(find kernel -type l)
+          echo "broken symlinks: $broken"
+          if [ "$broken" -gt 0 ]; then
+            echo "::warning::$broken broken symlinks remain in the kernel tree"
+          fi
 
       - name: Apply SYSVIPC kABI padding patch
         run: |
@@ -69,6 +116,7 @@ jobs:
           set -eux
           docker run --rm \
             -v "$PWD/kernel:/kernel" \
+            -v "$PWD/sm8750-modules:/sm8750-modules" \
             -v "$PWD/config:/config:ro" \
             -w /kernel \
             -e KERNELRELEASE \
