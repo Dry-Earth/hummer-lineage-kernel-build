@@ -56,26 +56,57 @@ jobs:
           cd common
           git submodule update --init --recursive --depth=1
           
-          # ===== 【最暴力的排雷法：缺什么文件夹，我们就建什么空文件夹！】 =====
+          # ===== 【文本排雷大法：全自动清理缺失的闭源驱动引用】 =====
           echo "========================================="
-          echo "正在暴力补齐缺失的源码目录（空壳战术）..."
+          echo "正在全自动清理缺失的闭源驱动引用..."
           echo "========================================="
           
-          # 针对一加闭源缺失的 soc/oplus/boot
-          mkdir -p drivers/soc/oplus/boot
-          touch drivers/soc/oplus/boot/Makefile
-          touch drivers/soc/oplus/boot/Kconfig
+          # 1. 修复 Kconfig 缺失引用 (全自动扫描)
+          find drivers -name "Kconfig" | while read -r kfile; do
+            dir_prefix=$(dirname "$kfile")
+            grep -oP '(?<=source ").*(?=")' "$kfile" | while read -r path; do
+              if [[ "$path" == drivers/* ]] || [[ "$path" == /* ]]; then
+                full_path="$path"
+              else
+                full_path="$dir_prefix/$path"
+              fi
+              
+              if [ ! -f "$full_path" ] && [ ! -d "$full_path" ]; then
+                echo "  -> [Kconfig] 发现缺失路径: $path，正在从 $kfile 移除引用..."
+                escaped_path=$(echo "$path" | sed 's/[]\/$*.^[]/\\&/g')
+                sed -i "/source \"$escaped_path\"/d" "$kfile"
+              fi
+            done
+          done
+
+          # 2. 修复 Makefile 缺失目录引用 (全自动扫描，干掉所有找不到的文件夹)
+          find drivers -name "Makefile" | while read -r mfile; do
+            dir_prefix=$(dirname "$mfile")
+            # 提取 += 后面的所有目录名，不管是 obj-y 还是 obj-$(CONFIG_XXX)
+            grep -oP '(?<=\+= )[\w\-]+(?=/)' "$mfile" | sort -u | while read -r dir; do
+              if [ -n "$dir" ] && [ ! -d "$dir_prefix/$dir" ]; then
+                echo "  -> [Makefile] 发现缺失目录: $dir_prefix/$dir，正在从 $mfile 移除引用..."
+                # 只要这一行包含了这个缺失的目录，就把这一整行删掉
+                sed -i "/+=.*\b$dir\//d" "$mfile"
+              fi
+            done
+          done
           
-          # 针对之前报错的其他缺失目录（防患于未然）
-          mkdir -p drivers/misc/vibrator/haptic_feedback
-          touch drivers/misc/vibrator/haptic_feedback/Makefile
-          touch drivers/misc/vibrator/haptic_feedback/Kconfig
+          # 3. 针对 soc/oplus/boot 的终极点杀（防止上面的正则漏网）
+          if [ -f drivers/soc/oplus/Makefile ]; then
+            if grep -q "boot" drivers/soc/oplus/Makefile; then
+              echo "  -> [终极点杀] 强行从 drivers/soc/oplus/Makefile 移除 boot 引用..."
+              sed -i '/boot/d' drivers/soc/oplus/Makefile
+            fi
+          fi
+          if [ -f drivers/soc/oplus/Kconfig ]; then
+            if grep -q "boot" drivers/soc/oplus/Kconfig; then
+              echo "  -> [终极点杀] 强行从 drivers/soc/oplus/Kconfig 移除 boot 引用..."
+              sed -i '/boot/d' drivers/soc/oplus/Kconfig
+            fi
+          fi
           
-          mkdir -p drivers/power/oplus
-          touch drivers/power/oplus/Makefile
-          touch drivers/power/oplus/Kconfig
-          
-          echo "✅ 假目录补齐完毕！编译器进去了只会发现是个空房间，不会报错了！"
+          echo "✅ 文本排雷完毕！"
           
           cd ..
 
@@ -149,7 +180,7 @@ jobs:
         run: |
           cd kernel_workspace/common
           echo "正在应用 Droidspaces GKI kABI 补丁..."
-          curl -fLo fix_sysvipc_kabi_6_7_8.patch https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
+          curl -fLo fix_sysvipc_kabi_6_7_8.patch https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-kernel-6.12-fix_sysvipc_kabi_6_7_8.patch
 
           if patch -p1 -F 3 --dry-run < fix_sysvipc_kabi_6_7_8.patch > /dev/null 2>&1; then
             patch -p1 -F 3 < fix_sysvipc_kabi_6_7_8.patch
