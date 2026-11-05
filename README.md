@@ -53,8 +53,9 @@ Linux version 6.6.144-4k-g6350e8af3f4c
 ## 目录内容
 
 ```
-.github/workflows/build-hummer-boot.yml   # 云端编译流程
-.github/workflows/extract-stock-config.yml # 从官方 boot.img 提取真实 config（无需设备）
+.github/workflows/build-hummer-boot.yml    # 第一版：已验证成功
+.github/workflows/build-hummer-boot-v2.yml # 第二版：读原厂 config，只补缺失项 + ccache
+.github/workflows/extract-stock-config.yml # 单独提取原厂 config（无需设备）
 .github/workflows/publish-boot.yml         # 把已有构建产物发成 Release（不重编）
 patches/0001-sysvipc-kabi.patch            # Droidspaces 官方 kABI padding 补丁
 config/hummer_config.gz                    # 从官方 boot.img 提取的真实内核配置
@@ -149,6 +150,103 @@ Actions → **Extract stock kernel config from LineageOS boot.img** → Run work
   （来自 Magisk v31.1）
 
 workflow 会**优先**用仓库缓存，失败后再回退到 `mirrorbits` → USTC 官方镜像。
+
+## v2：读取原厂已有选项，只补缺失项
+
+新增 workflow：**Build hummer boot.img v2 (stock config + container/network)**
+
+它和第一版 `build-hummer-boot.yml` 并存，互不影响。核心区别：
+
+1. 先解包原厂 `boot.img`，用 `extract-ikconfig` 读出**设备真实 config**
+   （失败才用仓库里的 `config/hummer_config.gz`，再失败才合并 defconfig）。
+2. 对每个选项判断：
+   - 已经是 `=y` → 记为 `keep`，不改；
+   - 是 `=m` → 提升为 `=y`；
+   - 缺失或 `not set` → 才补上。
+3. 生成 `config.report.txt`（选项 | 原厂值 | 最终值）和 `config.diff`。
+4. 用 ccache 缓存编译产物，第二次构建会快很多。
+
+### v2 补充的选项
+
+必须项（Droidspaces GKI 官方列表）：
+
+```
+SYSVIPC POSIX_MQUEUE IPC_NS PID_NS DEVTMPFS NETFILTER_XT_MATCH_ADDRTYPE
+```
+
+可选项（默认开）：
+
+```
+MACVLAN
+NETFILTER_XT_TARGET_REJECT NETFILTER_XT_TARGET_LOG NETFILTER_XT_MATCH_RECENT
+IP_SET IP_SET_HASH_IP IP_SET_HASH_NET NETFILTER_XT_SET
+TMPFS_POSIX_ACL TMPFS_XATTR
+```
+
+可选（默认关）：
+
+```
+USER_NS
+IP6_NF_NAT / IP6_NF_TARGET_MASQUERADE
+```
+
+> `IP6_NF_NAT` 单独做成开关：cctv18 的脚本里提到，部分 OPPO/一加机型开启后
+> 开机会出现“您的设备内部出现了问题”的 VINTF 提示。他的做法是打
+> `other_patch/config.patch`，在 `kernel/config_data` 里把
+> `CONFIG_IP6_NF_NAT=y` 改写成 `n` 来骗过检测。v2 没有采用这个 hack，
+> 而是默认不开启；需要 NAT66 时再手动打开。
+
+**明确禁止开启**（会破坏 kABI，stock 模块会拒载）：
+
+```
+CFS_BANDWIDTH CGROUP_PIDS NF_TABLES NET_L3_MASTER_DEV
+```
+
+其中 `NF_TABLES` 和 `NET_L3_MASTER_DEV` 会改变 `struct net` / `struct net_device`
+布局；cctv18 的 `Kernel_6.6.patch` 确实用 `net->ext` 和 `ANDROID_KABI_USE(8)`
+做了保护，但那份补丁同时包含：
+
+- `info->sig_ok = true`（绕过模块签名校验）
+- `check_version()` 版本不匹配时返回 1（绕过符号 CRC 校验）
+
+这两条会让“原厂模块仍然安全加载”的保证失效，所以**没有采用**。目前只按
+Droidspaces 官方 GKI 列表开启 kABI 安全的选项。
+
+### v2 构建结果
+
+- run：https://github.com/Dry-Earth/hummer-lineage-kernel-build/actions/runs/42071469405
+- Release：https://github.com/Dry-Earth/hummer-lineage-kernel-build/releases/tag/boot-42071469405
+- 直链：https://github.com/Dry-Earth/hummer-lineage-kernel-build/releases/download/boot-42071469405/new-boot.img
+- sha256：`5f1b83589098b4df6f40714fba52de1e0acd4afd252cdcdd079f588a8034464b`
+
+这次日志确认：
+
+```
+配置基线: stock_boot（直接从官方 boot.img 提取）
+changed config lines: 68
+[ok] SYSVIPC / POSIX_MQUEUE / IPC_NS / PID_NS / DEVTMPFS / NETFILTER_XT_MATCH_ADDRTYPE
+[ok] CFS_BANDWIDTH / CGROUP_PIDS / NF_TABLES / NET_L3_MASTER_DEV 未开启
+ccache version 4.10.2
+```
+
+第一次构建没有 ccache 命中，耗时约 21 分钟；之后 key 不变时会明显更快。
+
+### 关于编译器
+
+原厂 `Image` 里的字符串是：
+
+```
+Android (15071444, +pgo, +bolt, +lto, +mlgo, based on r596125) clang version 22.0.2
+```
+
+而 `build-manifest.xml` 钉住的是
+`platform/prebuilts/clang/host/linux-x86`（android-17.0.0_r1），
+DDK 镜像里则是 clang r510928。
+
+编译器版本**不参与** `vermagic`，也不参与 genksyms 的符号 CRC，
+所以用 r510928 编出来的 Image 依然能让原厂模块加载（已经实测成功）。
+如果以后要追求代码生成层面的完全一致，可以再切换到 manifest 钉住的
+clang r596125。
 
 ## 刷机
 
