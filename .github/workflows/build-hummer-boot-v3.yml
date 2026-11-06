@@ -1,0 +1,325 @@
+name: Build hummer boot.img v3 (stock clang + exact config)
+
+# v3 = 最保守的 boot.img 构建，目标是“刷了不卡第一屏”：
+#   1. 配置直接从官方 boot.img 提取（不是 gki+vendor 合并）
+#   2. 编译器用原厂 clang r596125（不是 DDK r510928），保证 KCFI 与 vendor 模块一致
+#   3. 只补 Droidspaces 必需的 6 项，不碰 USER_NS / NF_TABLES /
+#      NET_L3_MASTER_DEV / CGROUP_PIDS
+#   4. 先打 Droidspaces SYSVIPC kABI 补丁
+#   5. 只替换 boot.img 里的 Image，ramdisk / DTB 不动
+#
+# 原厂 clang 下载失败时工作流直接失败，不会偷偷回退 r510928。
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: '构建成功后发布 Release'
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  KERNEL_REPO: LineageOS/android_kernel_oneplus_sm8750
+  KERNEL_BRANCH: lineage-24.0
+  KERNEL_SHA: 6350e8af3f4c452d087fbd6fe1aabe03cbc0af75
+  MODULES_REPO: LineageOS/android_kernel_oneplus_sm8750-modules
+  MODULES_BRANCH: lineage-24.0
+  MODULES_SHA: e05c031ce1512477f2d5db7bfa26a859adfcfbc7
+  EXPECTED_RELEASE: 6.6.144-4k-g6350e8af3f4c
+
+  # 原厂 Image 的编译器字符串：Android (... based on r596125) clang version 22.0.2
+  CLANG_REV: clang-r596125
+  CLANG_SHA: 29182889399818f97baa65ea238c80e8117981eb
+
+  STOCK_BOOT_URL_CACHED: https://github.com/Dry-Earth/hummer-lineage-kernel-build/releases/download/test-assets/stock-boot.img
+  STOCK_BOOT_URL: https://mirrorbits.lineageos.org/full/hummer/20261030/boot.img
+  STOCK_BOOT_URL_FALLBACK: https://mirrors.ustc.edu.cn/lineageos/full/hummer/20261030/boot.img
+  STOCK_BOOT_SHA256: 826353bfa49cc58fbc04d71b1cf07bbbc58151049d7fbab73f3b77ac3a29938c
+  STOCK_BOOT_SIZE: "100663296"
+
+  MAGISKBOOT_URL_CACHED: https://github.com/Dry-Earth/hummer-lineage-kernel-build/releases/download/test-assets/libmagiskboot-x86_64.so
+  MAGISK_APK_URL: https://github.com/topjohnwu/Magisk/releases/download/v31.1/Magisk-v31.1.apk
+
+  DDK_IMAGE: ghcr.io/ylarod/ddk-min:android15-6.6-20260313
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+
+    steps:
+      - name: Free disk space
+        run: |
+          set -eux
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h
+
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Clone kernel source at the exact SHA
+        run: |
+          set -eux
+          mkdir -p kernel
+          cd kernel
+          git init -q
+          git remote add origin "https://github.com/${KERNEL_REPO}.git"
+          if ! git fetch --depth 1 --no-tags origin "$KERNEL_SHA"; then
+            echo "::warning::fetch by SHA failed, falling back to a deeper branch fetch"
+            git fetch --no-tags --depth 200 origin "$KERNEL_BRANCH"
+          fi
+          git checkout -q "$KERNEL_SHA" 2>/dev/null || git checkout -q FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$KERNEL_SHA"
+
+      - name: Clone modules source (sibling of kernel) at the exact SHA
+        run: |
+          set -eux
+          mkdir -p sm8750-modules
+          cd sm8750-modules
+          git init -q
+          git remote add origin "https://github.com/${MODULES_REPO}.git"
+          if ! git fetch --depth 1 --no-tags origin "$MODULES_SHA"; then
+            echo "::warning::fetch by SHA failed, falling back to a deeper branch fetch"
+            git fetch --no-tags --depth 200 origin "$MODULES_BRANCH"
+          fi
+          git checkout -q "$MODULES_SHA" 2>/dev/null || git checkout -q FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$MODULES_SHA"
+
+      - name: Prepare workspace paths / symlink check
+        run: |
+          set -eux
+          ln -sfn kernel sm8750
+          broken=0
+          while IFS= read -r link; do
+            target=$(readlink "$link")
+            case "$target" in
+              /*) resolved="$target" ;;
+              *)  resolved="$(dirname "$link")/$target" ;;
+            esac
+            if [ ! -e "$resolved" ]; then
+              echo "BROKEN: $link -> $target"
+              broken=$((broken + 1))
+            fi
+          done < <(find kernel -type l)
+          echo "broken symlinks: $broken"
+
+      - name: Apply SYSVIPC kABI padding patch
+        run: |
+          set -eux
+          cd kernel
+          patch -p1 --forward < ../patches/0001-sysvipc-kabi.patch
+          grep -n "ANDROID_KABI_USE(6, struct sysv_sem sysvsem)" include/linux/sched.h
+
+      - name: Download stock boot.img and magiskboot
+        run: |
+          set -eux
+          mkdir -p bootwork
+          ok=0
+          for u in "$STOCK_BOOT_URL_CACHED" "$STOCK_BOOT_URL" "$STOCK_BOOT_URL_FALLBACK"; do
+            echo "==> 尝试下载 $u"
+            if curl -fL --retry 3 --retry-all-errors --connect-timeout 20 \
+                 -A "Mozilla/5.0" -o bootwork/stock-boot.img "$u"; then
+              size=$(stat -c %s bootwork/stock-boot.img)
+              echo "downloaded $size bytes"
+              if [ "$size" = "$STOCK_BOOT_SIZE" ]; then ok=1; break; fi
+              echo "size mismatch, 换下一个源"
+            fi
+          done
+          test "$ok" = "1"
+          echo "$STOCK_BOOT_SHA256  bootwork/stock-boot.img" | sha256sum -c -
+
+          if curl -fL --retry 3 --retry-all-errors -o bootwork/magiskboot "$MAGISKBOOT_URL_CACHED"; then
+            chmod +x bootwork/magiskboot
+          else
+            curl -fL --retry 3 --retry-all-errors -o Magisk.apk "$MAGISK_APK_URL"
+            unzip -o Magisk.apk lib/x86_64/libmagiskboot.so -d magisk
+            install -m 755 magisk/lib/x86_64/libmagiskboot.so bootwork/magiskboot
+          fi
+          chmod +x bootwork/magiskboot
+
+      - name: Extract the exact config from official boot.img
+        run: |
+          set -eux
+          mkdir -p build-config
+          cd bootwork
+          ./magiskboot unpack stock-boot.img
+          ls -lh
+          if sh ../kernel/scripts/extract-ikconfig kernel > ../build-config/stock.config 2>/dev/null \
+             && grep -q '^CONFIG_' ../build-config/stock.config; then
+            echo "stock_boot" > ../build-config/source.txt
+          elif [ -s ../config/hummer_config.gz ]; then
+            zcat ../config/hummer_config.gz > ../build-config/stock.config
+            echo "repo_config" > ../build-config/source.txt
+          else
+            echo "::error::无法从 boot.img 提取 config"
+            exit 1
+          fi
+          test "$(grep -c '^CONFIG_' ../build-config/stock.config)" -gt 1000
+          echo "==> config source: $(cat ../build-config/source.txt) ($(grep -c '^CONFIG_' ../build-config/stock.config) 项)"
+
+      - name: Restore stock clang cache
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: clang-stock
+          key: hummer-boot-v3-clang-${{ env.CLANG_REV }}-${{ env.CLANG_SHA }}-v1
+
+      - name: Download stock clang r596125
+        run: |
+          set -eux
+          mkdir -p clang-stock
+          if [ -x clang-stock/bin/clang ]; then
+            echo "==> clang-stock 已存在，跳过下载"
+            exit 0
+          fi
+          base="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive"
+          urls="
+            ${base}/${CLANG_SHA}/${CLANG_REV}.tar.gz
+            ${base}/refs/heads/android17-release/${CLANG_REV}.tar.gz
+            ${base}/refs/heads/android17-qpr1-release/${CLANG_REV}.tar.gz
+            ${base}/refs/heads/android17-qpr2-release/${CLANG_REV}.tar.gz
+          "
+          ok=0
+          for u in $urls; do
+            echo "==> 尝试 $u"
+            if curl -fL --retry 2 --retry-all-errors --connect-timeout 20 -o /tmp/clang.tar.gz "$u"; then
+              rm -rf clang-stock
+              mkdir -p clang-stock
+              tar -xzf /tmp/clang.tar.gz -C clang-stock
+              ok=1
+              break
+            fi
+          done
+          test "$ok" = "1"
+          test -x clang-stock/bin/clang
+
+      - name: Verify stock clang
+        run: |
+          set -eux
+          clang-stock/bin/clang --version | head -n1
+          clang-stock/bin/clang --version | grep -q 'r596125'
+
+      - name: Save stock clang cache
+        if: ${{ steps.clang-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: clang-stock
+          key: hummer-boot-v3-clang-${{ env.CLANG_REV }}-${{ env.CLANG_SHA }}-v1
+
+      - name: Restore kernel ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: hummer-boot-v3-ccache-${{ env.KERNEL_SHA }}-${{ hashFiles('config/hummer_config.gz') }}-${{ env.CLANG_REV }}
+          restore-keys: |
+            hummer-boot-v3-ccache-${{ env.KERNEL_SHA }}-
+
+      - name: Pull DDK toolchain
+        run: docker pull "$DDK_IMAGE"
+
+      - name: Build Image with stock clang + exact config
+        env:
+          KERNELRELEASE: ${{ env.EXPECTED_RELEASE }}
+        run: |
+          set -eux
+          mkdir -p .ccache
+          docker run --rm \
+            -v "$PWD:/work" \
+            -v "$PWD/.ccache:/ccache" \
+            -w /work/kernel \
+            -e KERNELRELEASE \
+            -e CCACHE_DIR=/ccache \
+            -e CCACHE_BASEDIR=/work/kernel \
+            -e CCACHE_COMPRESS=1 \
+            -e CCACHE_MAXSIZE=5G \
+            "$DDK_IMAGE" \
+            bash /work/ci/build-image.sh
+
+      - name: Repack boot.img with the new Image
+        working-directory: bootwork
+        env:
+          PATCHVBMETAFLAG: "1"
+        run: |
+          set -eux
+          ./magiskboot unpack stock-boot.img
+          cp ../kernel/out/arch/arm64/boot/Image kernel
+          ./magiskboot repack stock-boot.img new-boot.img
+          stock_size=$(stat -c %s stock-boot.img)
+          new_size=$(stat -c %s new-boot.img)
+          if [ "$new_size" -gt "$stock_size" ]; then
+            echo "::error::new-boot.img ($new_size) 比原厂 boot 分区 ($stock_size) 还大"
+            exit 1
+          fi
+          if [ "$new_size" -lt "$stock_size" ]; then
+            truncate -s "$stock_size" new-boot.img
+          fi
+          sha256sum stock-boot.img new-boot.img
+          ls -lh new-boot.img
+
+      - name: Write build info
+        run: |
+          set -eux
+          {
+            echo "device:        OnePlus Ace 5 Pro (hummer)"
+            echo "rom:           LineageOS 24.0 (20261030)"
+            echo "kernel:        https://github.com/${KERNEL_REPO} @ ${KERNEL_SHA}"
+            echo "modules:       https://github.com/${MODULES_REPO} @ ${MODULES_SHA}"
+            echo "release:       ${EXPECTED_RELEASE}"
+            echo "config source: $(cat build-config/source.txt)"
+            echo "clang:         $(clang-stock/bin/clang --version | head -n1)"
+            echo "stock boot:    ${STOCK_BOOT_URL}"
+            echo "stock sha256:  ${STOCK_BOOT_SHA256}"
+            echo
+            echo "required container options:"
+            grep -E "^CONFIG_(SYSVIPC|POSIX_MQUEUE|IPC_NS|PID_NS|DEVTMPFS|NETFILTER_XT_MATCH_ADDRTYPE)=" kernel/out/config.final || true
+            echo
+            echo "config report (option | stock | final):"
+            cat kernel/out/config.report.txt
+            echo
+            echo "sha256:"
+            sha256sum bootwork/new-boot.img
+          } > build-info.txt
+          cat build-info.txt
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: hummer-boot-v3-${{ github.run_id }}
+          if-no-files-found: error
+          path: |
+            bootwork/new-boot.img
+            bootwork/stock-boot.img
+            kernel/out/arch/arm64/boot/Image
+            kernel/out/config.final
+            kernel/out/config.diff
+            kernel/out/config.report.txt
+            kernel/out/System.map.final
+            build-info.txt
+
+      - name: Publish release
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eux
+          tag="boot-v3-${GITHUB_RUN_ID}"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" bootwork/new-boot.img bootwork/stock-boot.img build-info.txt \
+              -R "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" bootwork/new-boot.img bootwork/stock-boot.img build-info.txt \
+              -R "$GITHUB_REPOSITORY" \
+              --title "hummer boot v3 (stock clang + exact config) ${GITHUB_RUN_ID}" \
+              --notes-file build-info.txt
+          fi
+          gh release view "$tag" -R "$GITHUB_REPOSITORY" --json url -q .url
