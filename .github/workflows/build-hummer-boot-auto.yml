@@ -27,6 +27,11 @@ on:
         required: true
         type: boolean
         default: true
+      safe_mode:
+        description: '安全基线：只开 6 项必需 + kABI 校验；第一次刷机请保持 true'
+        required: true
+        type: boolean
+        default: true
       extra_container_options:
         description: '额外开启容器常用项（CGROUP_DEVICE / TMPFS ACL+XATTR / iptables REJECT+LOG+RECENT / ipset）'
         required: true
@@ -290,19 +295,23 @@ jobs:
           set -eux
           extra=""
           required="SYSVIPC POSIX_MQUEUE IPC_NS PID_NS DEVTMPFS NETFILTER_XT_MATCH_ADDRTYPE"
-          forbidden="NF_TABLES NET_L3_MASTER_DEV CGROUP_PIDS CFS_BANDWIDTH"
-          if [ "${{ inputs.extra_container_options }}" = "true" ]; then
-            extra="$extra CGROUP_DEVICE TMPFS_POSIX_ACL TMPFS_XATTR"
-            extra="$extra NETFILTER_XT_TARGET_REJECT NETFILTER_XT_TARGET_LOG NETFILTER_XT_MATCH_RECENT"
-            extra="$extra IP_SET IP_SET_HASH_IP IP_SET_HASH_NET NETFILTER_XT_SET"
-          fi
-          if [ "${{ inputs.enable_bridge_netfilter }}" = "true" ]; then extra="$extra BRIDGE_NETFILTER"; fi
-          if [ "${{ inputs.enable_macvlan }}" = "true" ]; then extra="$extra MACVLAN"; fi
-          if [ "${{ inputs.enable_ipv6_nat }}" = "true" ]; then extra="$extra IP6_NF_NAT IP6_NF_TARGET_MASQUERADE"; fi
-          if [ "${{ inputs.enable_user_ns }}" = "true" ]; then
-            required="$required USER_NS"
+          forbidden="USER_NS NF_TABLES NET_L3_MASTER_DEV CGROUP_PIDS CFS_BANDWIDTH"
+          if [ "${{ inputs.safe_mode }}" = "true" ]; then
+            echo "==> safe_mode=true: only the six required options"
           else
-            forbidden="USER_NS $forbidden"
+            if [ "${{ inputs.extra_container_options }}" = "true" ]; then
+              extra="$extra CGROUP_DEVICE TMPFS_POSIX_ACL TMPFS_XATTR"
+              extra="$extra NETFILTER_XT_TARGET_REJECT NETFILTER_XT_TARGET_LOG NETFILTER_XT_MATCH_RECENT"
+              extra="$extra IP_SET IP_SET_HASH_IP IP_SET_HASH_NET NETFILTER_XT_SET"
+            fi
+            if [ "${{ inputs.enable_bridge_netfilter }}" = "true" ]; then extra="$extra BRIDGE_NETFILTER"; fi
+            if [ "${{ inputs.enable_macvlan }}" = "true" ]; then extra="$extra MACVLAN"; fi
+            if [ "${{ inputs.enable_ipv6_nat }}" = "true" ]; then extra="$extra IP6_NF_NAT IP6_NF_TARGET_MASQUERADE"; fi
+            if [ "${{ inputs.enable_user_ns }}" = "true" ]; then
+              required="$required USER_NS"
+            else
+              forbidden="USER_NS $forbidden"
+            fi
           fi
           extra=$(printf '%s' "$extra" | xargs)
           echo "REQUIRED_OPTS=$required" >> "$GITHUB_ENV"
@@ -407,6 +416,23 @@ jobs:
           sha256sum stock-boot.img new-boot.img
           ls -lh new-boot.img
 
+      - name: Verify only the kernel changed in boot.img
+        working-directory: bootwork
+        run: |
+          set -eux
+          rm -rf unpack-stock unpack-new
+          mkdir -p unpack-stock unpack-new
+          (cd unpack-stock && ../magiskboot unpack ../stock-boot.img) || true
+          (cd unpack-new && ../magiskboot unpack ../new-boot.img) || true
+          test -f unpack-new/kernel
+          cmp unpack-new/kernel ../kernel/out/arch/arm64/boot/Image
+          for f in $(cd unpack-stock && find . -maxdepth 1 -type f ! -name kernel ! -name header -printf '%f\n'); do
+            test -f "unpack-new/$f" || { echo "::error::new boot.img lost $f"; exit 1; }
+            cmp "unpack-stock/$f" "unpack-new/$f"
+            echo "[ok] unchanged: $f"
+          done
+          echo "only the kernel Image changed"
+
       - name: Write build info
         run: |
           set -eux
@@ -424,6 +450,7 @@ jobs:
             echo "config source: stock_boot"
             echo "clang:         $(clang-stock/bin/clang --version | head -n1)"
             echo "extra options: ${EXTRA_OPTS:-none}"
+            echo "safe mode:     ${{ inputs.safe_mode }}"
             echo "user ns:       ${{ inputs.enable_user_ns }}"
             echo "verify kABI:   ${{ inputs.verify_kabi }}"
             echo
