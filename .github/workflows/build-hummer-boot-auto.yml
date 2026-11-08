@@ -32,6 +32,11 @@ on:
         required: true
         type: boolean
         default: true
+      enable_user_ns:
+        description: '开启原生 CONFIG_USER_NS（容器沙箱/rootless；比 LKM live patch 更稳）'
+        required: true
+        type: boolean
+        default: true
       enable_bridge_netfilter:
         description: '开启 BRIDGE_NETFILTER（Docker bridge 过滤需要）'
         required: true
@@ -284,6 +289,8 @@ jobs:
         run: |
           set -eux
           extra=""
+          required="SYSVIPC POSIX_MQUEUE IPC_NS PID_NS DEVTMPFS NETFILTER_XT_MATCH_ADDRTYPE"
+          forbidden="NF_TABLES NET_L3_MASTER_DEV CGROUP_PIDS CFS_BANDWIDTH"
           if [ "${{ inputs.extra_container_options }}" = "true" ]; then
             extra="$extra CGROUP_DEVICE TMPFS_POSIX_ACL TMPFS_XATTR"
             extra="$extra NETFILTER_XT_TARGET_REJECT NETFILTER_XT_TARGET_LOG NETFILTER_XT_MATCH_RECENT"
@@ -292,9 +299,18 @@ jobs:
           if [ "${{ inputs.enable_bridge_netfilter }}" = "true" ]; then extra="$extra BRIDGE_NETFILTER"; fi
           if [ "${{ inputs.enable_macvlan }}" = "true" ]; then extra="$extra MACVLAN"; fi
           if [ "${{ inputs.enable_ipv6_nat }}" = "true" ]; then extra="$extra IP6_NF_NAT IP6_NF_TARGET_MASQUERADE"; fi
+          if [ "${{ inputs.enable_user_ns }}" = "true" ]; then
+            required="$required USER_NS"
+          else
+            forbidden="USER_NS $forbidden"
+          fi
           extra=$(printf '%s' "$extra" | xargs)
+          echo "REQUIRED_OPTS=$required" >> "$GITHUB_ENV"
           echo "EXTRA_OPTS=$extra" >> "$GITHUB_ENV"
+          echo "FORBIDDEN_OPTS=$forbidden" >> "$GITHUB_ENV"
+          echo "required options: $required"
           echo "extra options: $extra"
+          echo "forbidden options: $forbidden"
 
       - name: Pull DDK toolchain
         run: docker pull "$DDK_IMAGE"
@@ -334,7 +350,9 @@ jobs:
             -e OUT=/work/kernel/out \
             -e MODE=new \
             -e TARGETS=Image \
+            -e REQUIRED_OPTS \
             -e EXTRA_OPTS \
+            -e FORBIDDEN_OPTS \
             -e CCACHE_DIR=/ccache \
             -e CCACHE_BASEDIR=/work/kernel \
             -e CCACHE_COMPRESS=1 \
@@ -355,7 +373,7 @@ jobs:
       - name: Report config changes
         run: |
           set -eux
-          options="SYSVIPC POSIX_MQUEUE IPC_NS PID_NS DEVTMPFS NETFILTER_XT_MATCH_ADDRTYPE $EXTRA_OPTS"
+          options="$REQUIRED_OPTS $EXTRA_OPTS"
           {
             for o in $options; do
               b=$(grep -E "^(# )?CONFIG_${o}(=| is not set)" kernel/out-stock/config.final 2>/dev/null | head -n1 || true)
@@ -406,6 +424,7 @@ jobs:
             echo "config source: stock_boot"
             echo "clang:         $(clang-stock/bin/clang --version | head -n1)"
             echo "extra options: ${EXTRA_OPTS:-none}"
+            echo "user ns:       ${{ inputs.enable_user_ns }}"
             echo "verify kABI:   ${{ inputs.verify_kabi }}"
             echo
             echo "config report (option | stock | final):"
