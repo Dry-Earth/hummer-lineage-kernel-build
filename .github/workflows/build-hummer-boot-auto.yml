@@ -373,12 +373,13 @@ jobs:
       - name: Compare kABI struct layouts
         if: ${{ inputs.verify_kabi }}
         run: |
-          set -eux
+          set -euxo pipefail
           mkdir -p build-config
           python3 ci/compare-kabi.py \
             --stock kernel/out-stock/vmlinux \
             --new kernel/out/vmlinux \
-            --allow-new-fields sysvsem,sysvshm | tee build-config/kabi.txt
+            --allow-new-fields sysvsem,sysvshm > build-config/kabi.txt
+          cat build-config/kabi.txt
 
       - name: Report config changes
         run: |

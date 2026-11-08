@@ -18,6 +18,14 @@ DEFAULT_STRUCTS = [
     'fs_struct', 'files_struct', 'mm_struct', 'cgroup', 'css_set',
 ]
 DEFAULT_ALLOW_NEW = {'sysvsem', 'sysvshm'}
+# The Droidspaces SYSVIPC kABI patch deliberately repurposes the last three
+# Android KABI reserve slots for sysvsem/sysvshm.  pahole reports the reserve
+# names as offsets inside the anonymous union, so allow exactly those three.
+EXPECTED_CHANGES = {
+    ('task_struct', 'android_kabi_reserved6'),
+    ('task_struct', 'android_kabi_reserved7'),
+    ('task_struct', 'android_kabi_reserved8'),
+}
 SIZE_RE = re.compile(r'/\*\s*size:\s*(\d+)')
 MEMBER_RE = re.compile(r'/\*\s*(\d+)(?::\d+)?\s+(\d+)\s*\*/')
 
@@ -71,6 +79,9 @@ def main():
             problems.append(f'size {old_size} -> {new_size}')
         for name in sorted(set(old_members) | set(new_members)):
             if name in allow_new and name not in old_members:
+                continue
+            if (struct, name) in EXPECTED_CHANGES:
+                print(f'[allow] {struct} {name}: SYSVIPC kABI reserve')
                 continue
             if name not in old_members:
                 problems.append(f'new field {name} {new_members[name]}')
