@@ -295,8 +295,9 @@ jobs:
           set -eux
           extra=""
           required="SYSVIPC POSIX_MQUEUE IPC_NS PID_NS DEVTMPFS NETFILTER_XT_MATCH_ADDRTYPE"
-          forbidden="USER_NS NF_TABLES NET_L3_MASTER_DEV CGROUP_PIDS CFS_BANDWIDTH"
+          forbidden="NF_TABLES NET_L3_MASTER_DEV CGROUP_PIDS CFS_BANDWIDTH"
           if [ "${{ inputs.safe_mode }}" = "true" ]; then
+            forbidden="USER_NS $forbidden"
             echo "==> safe_mode=true: only the six required options"
           else
             if [ "${{ inputs.extra_container_options }}" = "true" ]; then
