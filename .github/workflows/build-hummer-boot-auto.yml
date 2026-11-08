@@ -115,6 +115,7 @@ jobs:
           test "$ok" = "1"
           test -s manifest.xml
           python3 ci/parse-manifest.py manifest.xml | tee metadata.env
+          . ./metadata.env
           cat metadata.env >> "$GITHUB_ENV"
           test -n "$KERNEL_SHA"
           test -n "$MODULES_SHA"
